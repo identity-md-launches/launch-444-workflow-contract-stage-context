@@ -376,12 +376,15 @@ contract EdgeCasesTest is PactsBase {
     function test_attackOnLastTileWorksAndBeyondIsRejected() public {
         buy(alice, 2);
         attackNow(alice, 143, 0, 1);
-        uint256 bad = proposeAttack(alice, 144, 0, 1);
+        uint256 proposalsBefore = guilds.proposalCount();
+        // Holder validation reads the tile at proposal creation, so invalid IDs fail here.
         vm.expectRevert(Realm.InvalidTile.selector);
-        realm.declareAttack(bad);
-        uint256 huge = proposeAttack(alice, type(uint256).max, 0, 1);
+        proposeAttack(alice, 144, 0, 1);
         vm.expectRevert(Realm.InvalidTile.selector);
-        realm.declareAttack(huge);
+        proposeAttack(alice, type(uint256).max, 0, 1);
+        assertEq(guilds.proposalCount(), proposalsBefore);
+        assertEq(realm.reserveOf(gA), 1);
+        assertEq(realm.attacksOn(0, 143).length, 1);
         nextEpoch();
         realm.settle();
         assertEq(tileHolder(143), gA);

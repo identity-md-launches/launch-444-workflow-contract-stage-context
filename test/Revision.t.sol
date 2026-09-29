@@ -77,6 +77,66 @@ contract RevisionTest is PactsBase {
         assertEq(diplomacy.getPact(pact).bondB, 1);
     }
 
+    /// @dev A failed signature must leave the other guild's approval available for a new offer.
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_shortBondCanBeReplacedWithoutConsumingTheOtherApproval(
+        uint256 bondSeedA,
+        uint256 bondSeedB,
+        bool shortA,
+        bool reverse
+    ) public {
+        (uint256 gA, uint256 gB) = _fundTwoGuilds();
+        uint256 bondA = bound(bondSeedA, 1, 1000e18 - 1);
+        uint256 bondB = bound(bondSeedB, 1, 1000e18 - 1);
+        uint256 minimumA = bondB + (shortA ? 0 : 1);
+        uint256 minimumB = bondA + (shortA ? 1 : 0);
+        uint256 a = _pact(alice, gB, bondA, minimumA);
+        uint256 b = _pact(bob, gA, bondB, minimumB);
+        vm.expectRevert(Diplomacy.ProposalsDoNotMatch.selector);
+        diplomacy.sign(a, b);
+        vm.expectRevert(Diplomacy.ProposalsDoNotMatch.selector);
+        diplomacy.sign(b, a);
+        _assertUnconsumed(a, b, gA, gB);
+
+        uint256 rejected = shortA ? a : b;
+        if (shortA) {
+            bondA += 1;
+            a = _pact(alice, gB, bondA, minimumA);
+        } else {
+            bondB += 1;
+            b = _pact(bob, gA, bondB, minimumB);
+        }
+        vm.prank(outsider);
+        uint256 id = reverse ? diplomacy.sign(b, a) : diplomacy.sign(a, b);
+        Diplomacy.Pact memory p = diplomacy.getPact(id);
+        assertEq(p.guildA, reverse ? gB : gA);
+        assertEq(p.guildB, reverse ? gA : gB);
+        assertEq(p.bondA, reverse ? bondB : bondA);
+        assertEq(p.bondB, reverse ? bondA : bondB);
+        assertTrue(guilds.getProposal(a).executed);
+        assertTrue(guilds.getProposal(b).executed);
+        assertFalse(guilds.getProposal(rejected).executed);
+        assertEq(guilds.treasuryOf(gA), 1000e18 - bondA);
+        assertEq(guilds.treasuryOf(gB), 1000e18 - bondB);
+        assertEq(token.balanceOf(address(diplomacy)), bondA + bondB);
+        warpToEpoch(10);
+        diplomacy.expire(id);
+        assertEq(guilds.treasuryOf(gA), 1000e18);
+        assertEq(guilds.treasuryOf(gB), 1000e18);
+        assertEq(token.balanceOf(address(diplomacy)), 0);
+    }
+
+    function test_maximumMinimumCannotBeSatisfiedByOneWeiBonds() public {
+        (uint256 gA, uint256 gB) = _fundTwoGuilds();
+        uint256 a = _pact(alice, gB, 1, type(uint256).max);
+        uint256 b = _pact(bob, gA, 1, 0);
+        vm.expectRevert(Diplomacy.ProposalsDoNotMatch.selector);
+        diplomacy.sign(a, b);
+        vm.expectRevert(Diplomacy.ProposalsDoNotMatch.selector);
+        diplomacy.sign(b, a);
+        _assertUnconsumed(a, b, gA, gB);
+    }
+
     function _fundTwoGuilds() internal returns (uint256 gA, uint256 gB) {
         gA = found(alice, "Alpha");
         gB = found(bob, "Beta");

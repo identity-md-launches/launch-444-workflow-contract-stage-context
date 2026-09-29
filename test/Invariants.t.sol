@@ -40,6 +40,8 @@ contract PactsHandler is Test {
     mapping(address actor => uint256) public ghostPaidOutTo;
     mapping(uint256 season => uint256) public ghostClaimed;
     mapping(uint256 pactId => Diplomacy.Status) public ghostTerminalStatus;
+    mapping(uint256 pactId => uint256) public ghostPactProposalA;
+    mapping(uint256 pactId => uint256) public ghostPactProposalB;
     uint256 public nextSeasonToClose;
     uint256 public ghostSettled; // settledEpochs as last observed by a settlement action
     mapping(string => uint256) public calls;
@@ -663,6 +665,8 @@ contract PactsHandler is Test {
         uint256 tB;
         uint256 bondA;
         uint256 bondB;
+        uint256 minimumA;
+        uint256 minimumB;
         uint256 epochs;
         uint256 pa;
         uint256 pb;
@@ -688,10 +692,13 @@ contract PactsHandler is Test {
         s.bondA = bound(bondSeedA, 1, s.tA);
         s.bondB = bound(bondSeedB, 1, s.tB);
         s.epochs = bound(epochsSeed, 1, 12);
+        // Exercise waived minima, exact consent and a counter-bond one wei too small.
+        s.minimumA = epochsSeed % 3 == 0 ? 0 : s.bondB + (epochsSeed % 3 == 2 ? 1 : 0);
+        s.minimumB = bondSeedA % 3 == 0 ? 0 : s.bondA + (bondSeedA % 3 == 2 ? 1 : 0);
         vm.prank(s.a);
-        s.pa = guilds.propose(Guilds.Kind.Pact, address(diplomacy), s.bondA, s.gB, s.epochs, 0);
+        s.pa = guilds.propose(Guilds.Kind.Pact, address(diplomacy), s.bondA, s.gB, s.epochs, s.minimumA);
         vm.prank(s.b);
-        s.pb = guilds.propose(Guilds.Kind.Pact, address(diplomacy), s.bondB, s.gA, s.epochs, 0);
+        s.pb = guilds.propose(Guilds.Kind.Pact, address(diplomacy), s.bondB, s.gA, s.epochs, s.minimumB);
         s.approved = _voteAll(s.pa, s.gA, s.a, epochsSeed);
         s.approved = _voteAll(s.pb, s.gB, s.b, bondSeedA) && s.approved;
         _signPact(s);
@@ -699,8 +706,29 @@ contract PactsHandler is Test {
 
     function _signPact(PactPlan memory s) internal {
         uint256 dipBal = token.balanceOf(address(diplomacy));
+        if (s.bondB < s.minimumA || s.bondA < s.minimumB) {
+            uint256 guildBal = token.balanceOf(address(guilds));
+            uint256 pactCount = diplomacy.pactCount();
+            vm.expectRevert(Diplomacy.ProposalsDoNotMatch.selector);
+            diplomacy.sign(s.pa, s.pb);
+            vm.expectRevert(Diplomacy.ProposalsDoNotMatch.selector);
+            diplomacy.sign(s.pb, s.pa);
+            assertFalse(guilds.getProposal(s.pa).executed);
+            assertFalse(guilds.getProposal(s.pb).executed);
+            assertEq(diplomacy.pactCount(), pactCount);
+            assertEq(diplomacy.activePactBetween(s.gA, s.gB), 0);
+            assertEq(token.balanceOf(address(diplomacy)), dipBal);
+            assertEq(token.balanceOf(address(guilds)), guildBal);
+            assertEq(guilds.treasuryOf(s.gA), s.tA);
+            assertEq(guilds.treasuryOf(s.gB), s.tB);
+            calls["pactMinimumRejected"]++;
+            return;
+        }
         if (s.approved) {
             uint256 id = diplomacy.sign(s.pa, s.pb);
+            ghostPactProposalA[id] = s.pa;
+            ghostPactProposalB[id] = s.pb;
+            calls["pactSigned"]++;
             Diplomacy.Pact memory p = diplomacy.getPact(id);
             assertEq(uint256(p.status), uint256(Diplomacy.Status.Active));
             assertEq(p.bondA + p.bondB, s.bondA + s.bondB);
@@ -904,6 +932,31 @@ contract PactsInvariantTest is Test {
 
     // -------------------------------------------------------- token flows
 
+    function test_pactHandlerExercisesBothMinimaAndExpiry() public {
+        handler.found(0);
+        handler.found(1);
+        handler.donate(0, 1, 9e18);
+        handler.donate(1, 2, 9e18);
+        handler.pact(0, 2, 1, 3, 2); // Alpha's minimum is missed.
+        handler.pact(0, 2, 2, 3, 3); // Beta's minimum is missed.
+        handler.pact(1, 1, 2, 3, 2); // Both are missed, guild order reversed.
+        assertEq(handler.calls("pactMinimumRejected"), 3);
+        assertEq(diplomacy.pactCount(), 0);
+        handler.pact(0, 2, 1, 3, 1); // Both minima met exactly.
+        assertEq(handler.calls("pactSigned"), 1);
+        assertEq(token.balanceOf(address(diplomacy)), 4);
+        invariant_pactBondsHonorBothApprovedProposals();
+        handler.warp(EPOCH);
+        handler.expirePact(1);
+        assertEq(guilds.treasuryOf(1), 9e18);
+        assertEq(guilds.treasuryOf(2), 9e18);
+        invariant_pactBondsHonorBothApprovedProposals();
+        invariant_gameHoldsExactlyWhatWasPaidIn();
+        invariant_diplomacyHoldsExactlyTheActiveBonds();
+        invariant_guildsHoldsExactlyTheTreasuries();
+        invariant_finishedPactsNeverReopen();
+    }
+
     /// @dev Reach every new handler branch deterministically as well as in random call sequences.
     function test_queuedAttackHandlerRejectsChangedMembershipAndAllowsOriginalMember() public {
         handler.found(0);
@@ -1069,6 +1122,21 @@ contract PactsInvariantTest is Test {
     }
 
     // ------------------------------------------------------------- pacts
+
+    function invariant_pactBondsHonorBothApprovedProposals() public view {
+        for (uint256 id = 1; id <= diplomacy.pactCount(); ++id) {
+            Diplomacy.Pact memory p = diplomacy.getPact(id);
+            Guilds.Proposal memory a = guilds.getProposal(handler.ghostPactProposalA(id));
+            Guilds.Proposal memory b = guilds.getProposal(handler.ghostPactProposalB(id));
+            assertTrue(a.executed && b.executed);
+            assertEq(p.guildA, a.guildId);
+            assertEq(p.guildB, b.guildId);
+            assertEq(p.bondA, a.amount);
+            assertEq(p.bondB, b.amount);
+            assertGe(p.bondB, a.data3, "Alpha's approved minimum was not honored");
+            assertGe(p.bondA, b.data3, "Beta's approved minimum was not honored");
+        }
+    }
 
     function invariant_finishedPactsNeverReopen() public view {
         for (uint256 p = 1; p <= diplomacy.pactCount(); ++p) {
