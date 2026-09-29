@@ -536,7 +536,17 @@ contract EdgeCasesTest is PactsBase {
         assertEq(diplomacy.getPact(pactId).endEpoch, epochs); // 1 + epochs - 1
         warpToEpoch(1 + delay);
         buy(alice, 1);
-        attackNow(alice, 7, gB, 1);
+        uint256 pid = proposeAttack(alice, 7, gB, 1);
+        if (delay < epochs) {
+            // Inside the window only a member of the attacking guild may declare the betrayal.
+            vm.prank(outsider);
+            vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+            realm.declareAttack(pid);
+            declareAs(alice, pid);
+        } else {
+            vm.prank(outsider);
+            realm.declareAttack(pid); // the pact has run out: anyone may declare
+        }
         Diplomacy.Pact memory p = diplomacy.getPact(pactId);
         if (delay < epochs) {
             assertEq(uint256(p.status), uint256(Diplomacy.Status.Broken));
@@ -653,7 +663,7 @@ contract EdgeCasesTest is PactsBase {
         uint256 pc = proposePact(carol, gA, 2e18, 5);
         uint256 withC = diplomacy.sign(pa2, pc);
         buy(alice, 1);
-        attackNow(alice, 7, gB, 1);
+        betrayNow(alice, 7, gB, 1);
         assertEq(uint256(diplomacy.getPact(withB).status), uint256(Diplomacy.Status.Broken));
         assertEq(uint256(diplomacy.getPact(withC).status), uint256(Diplomacy.Status.Active));
         assertEq(token.balanceOf(address(diplomacy)), 4e18);

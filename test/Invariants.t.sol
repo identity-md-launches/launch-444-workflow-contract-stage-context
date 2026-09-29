@@ -41,6 +41,7 @@ contract PactsHandler is Test {
     mapping(uint256 season => uint256) public ghostClaimed;
     mapping(uint256 pactId => Diplomacy.Status) public ghostTerminalStatus;
     uint256 public nextSeasonToClose;
+    uint256 public ghostSettled; // settledEpochs as last observed by a settlement action
     mapping(string => uint256) public calls;
 
     constructor(
@@ -312,35 +313,60 @@ contract PactsHandler is Test {
             return;
         }
         uint256 pactId = holder == 0 ? 0 : diplomacy.activePactBetween(g, holder);
-        Diplomacy.Pact memory p;
-        uint256 victimTreasury;
-        uint256 attackerTreasury;
-        if (pactId != 0) {
-            p = diplomacy.getPact(pactId);
-            victimTreasury = guilds.treasuryOf(holder);
-            attackerTreasury = guilds.treasuryOf(g);
-        }
+        PactWatch memory w = _watchPact(pactId, g, holder);
         uint256 alive = aliveTroops();
+        if (w.betrayal) {
+            // This handler is in no guild: it must not be able to make the guild a betrayer.
+            try realm.declareAttack(pid) {
+                assertTrue(false, "a non-member declared a betrayal");
+            } catch {}
+            assertEq(realm.reserveOf(g), reserve);
+            assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Active));
+        }
+        vm.prank(a);
         uint256 epoch = realm.declareAttack(pid);
         assertEq(epoch, realm.currentEpoch());
         assertEq(realm.reserveOf(g), reserve - troops, "committed troops leave the reserve");
         assertEq(aliveTroops(), alive, "declaring an attack destroys no troops");
         if (holder != 0) assertTrue(realm.hasPendingAttack(g, holder));
+        if (pactId != 0) _checkPactAfterAttack(pactId, g, holder, w);
+    }
+
+    struct PactWatch {
+        bool betrayal;
+        uint256 bonds;
+        uint256 victimTreasury;
+        uint256 attackerTreasury;
+    }
+
+    function _watchPact(uint256 pactId, uint256 attacker, uint256 victim) internal view returns (PactWatch memory w) {
+        uint256 epoch = realm.currentEpoch();
         if (pactId != 0) {
-            Diplomacy.Pact memory after_ = diplomacy.getPact(pactId);
-            assertEq(diplomacy.activePactBetween(g, holder), 0, "an attacked pact is no longer active");
-            if (epoch <= p.endEpoch) {
-                assertEq(uint256(after_.status), uint256(Diplomacy.Status.Broken));
-                assertEq(guilds.treasuryOf(holder), victimTreasury + p.bondA + p.bondB, "victim receives both bonds");
-                assertEq(guilds.treasuryOf(g), attackerTreasury, "betrayer gets nothing back");
-                ghostTerminalStatus[pactId] = Diplomacy.Status.Broken;
-            } else {
-                assertEq(uint256(after_.status), uint256(Diplomacy.Status.Expired));
-                ghostTerminalStatus[pactId] = Diplomacy.Status.Expired;
-            }
+            Diplomacy.Pact memory p = diplomacy.getPact(pactId);
+            w.betrayal = epoch <= p.endEpoch;
+            w.bonds = p.bondA + p.bondB;
+            w.victimTreasury = guilds.treasuryOf(victim);
+            w.attackerTreasury = guilds.treasuryOf(attacker);
+        }
+        assertEq(diplomacy.wouldBreakPact(attacker, victim, epoch), w.betrayal, "wouldBreakPact disagrees");
+    }
+
+    function _checkPactAfterAttack(uint256 pactId, uint256 attacker, uint256 victim, PactWatch memory w) internal {
+        Diplomacy.Pact memory after_ = diplomacy.getPact(pactId);
+        assertEq(diplomacy.activePactBetween(attacker, victim), 0, "an attacked pact is no longer active");
+        if (w.betrayal) {
+            assertEq(uint256(after_.status), uint256(Diplomacy.Status.Broken));
+            assertEq(guilds.treasuryOf(victim), w.victimTreasury + w.bonds, "victim receives both bonds");
+            assertEq(guilds.treasuryOf(attacker), w.attackerTreasury, "betrayer gets nothing back");
+            ghostTerminalStatus[pactId] = Diplomacy.Status.Broken;
+        } else {
+            assertEq(uint256(after_.status), uint256(Diplomacy.Status.Expired));
+            ghostTerminalStatus[pactId] = Diplomacy.Status.Expired;
         }
     }
 
+    /// @dev Settles up to `max` ended epochs one at a time with `settle()`, checking each epoch's
+    ///      tile outcomes against what was declared.
     function settle(uint256 maxSeed) external {
         calls["settle"]++;
         uint256 current = realm.currentEpoch();
@@ -349,8 +375,30 @@ contract PactsHandler is Test {
             try realm.settle() {
                 assertTrue(false, "settled an epoch that has not ended");
             } catch {}
+            try realm.settleStep(1) {
+                assertTrue(false, "stepped an epoch that has not ended");
+            } catch {}
             return;
         }
+        uint256 max = bound(maxSeed, 1, 4);
+        uint256 alive = aliveTroops();
+        uint256 realmBal = token.balanceOf(address(realm));
+        for (uint256 i; i < max && realm.currentEpoch() > realm.settledEpochs(); ++i) {
+            _settleOneEpoch(false, 0, 0);
+        }
+        uint256 aliveAfter = aliveTroops();
+        assertLe(aliveAfter, alive, "settlement never creates troops");
+        ghostTroopsLost += alive - aliveAfter;
+        assertEq(token.balanceOf(address(realm)), realmBal, "settlement moves no tokens");
+        ghostSettled = realm.settledEpochs();
+    }
+
+    /// @dev Settles every ended epoch in one call, the way a keeper would.
+    function settlePendingBatch(uint256 maxSeed) external {
+        calls["settlePendingBatch"]++;
+        uint256 current = realm.currentEpoch();
+        uint256 settled = realm.settledEpochs();
+        if (current <= settled) return;
         uint256 max = bound(maxSeed, 1, 200);
         uint256 alive = aliveTroops();
         uint256 realmBal = token.balanceOf(address(realm));
@@ -362,6 +410,147 @@ contract PactsHandler is Test {
         assertLe(aliveAfter, alive, "settlement never creates troops");
         ghostTroopsLost += alive - aliveAfter;
         assertEq(token.balanceOf(address(realm)), realmBal, "settlement moves no tokens");
+        ghostSettled = realm.settledEpochs();
+    }
+
+    /// @dev Settles one ended epoch with `settleStep(budget)`, doing player actions between the steps.
+    function settleStepwise(uint256 budgetSeed, uint256 interleaveSeed) external {
+        calls["settleStepwise"]++;
+        if (realm.currentEpoch() <= realm.settledEpochs()) {
+            try realm.settleStep(0) {
+                assertTrue(false, "a zero budget was accepted");
+            } catch {}
+            return;
+        }
+        uint256 alive = aliveTroops();
+        int256 realmBal = int256(token.balanceOf(address(realm)));
+        (uint256 boughtDuring, int256 balanceDelta) = _settleOneEpoch(true, bound(budgetSeed, 1, 6), interleaveSeed);
+        uint256 aliveAfter = aliveTroops();
+        assertLe(aliveAfter, alive + boughtDuring, "settlement never creates troops");
+        ghostTroopsLost += alive + boughtDuring - aliveAfter;
+        assertEq(int256(token.balanceOf(address(realm))), realmBal + balanceDelta, "settlement moves no tokens");
+        ghostSettled = realm.settledEpochs();
+    }
+
+    struct TileSnapshot {
+        uint256 tile;
+        uint256 holder;
+        uint256 garrison;
+        Realm.Attack[] attacks;
+    }
+
+    function _settleOneEpoch(bool stepwise, uint256 budget, uint256 interleaveSeed)
+        internal
+        returns (uint256 boughtDuring, int256 balanceDelta)
+    {
+        uint256 epoch = realm.settledEpochs();
+        uint256[] memory tiles = realm.attackedTilesIn(epoch);
+        TileSnapshot[] memory snaps = new TileSnapshot[](tiles.length);
+        for (uint256 i; i < tiles.length; ++i) {
+            (uint256 h, uint256 g) = realm.tile(tiles[i]);
+            snaps[i] = TileSnapshot({tile: tiles[i], holder: h, garrison: g, attacks: realm.attacksOn(epoch, tiles[i])});
+        }
+        if (!stepwise) {
+            assertEq(realm.settle(), epoch);
+        } else {
+            (boughtDuring, balanceDelta) = _stepThrough(epoch, budget, interleaveSeed);
+        }
+        assertEq(realm.settledEpochs(), epoch + 1);
+        (bool started, uint256 done,) = realm.settlementProgress();
+        assertFalse(started, "progress not cleared");
+        assertEq(done, 0);
+        _checkOutcomes(snaps);
+    }
+
+    /// @dev Runs `settleStep(budget)` until the epoch completes. Between steps a player buys troops,
+    ///      collects income or declares an attack in the current epoch, so that a half-done
+    ///      settlement is observed by ordinary play. Returns troops bought and income paid meanwhile.
+    function _stepThrough(uint256 epoch, uint256 budget, uint256 seed)
+        internal
+        returns (uint256 boughtDuring, int256 balanceDelta)
+    {
+        bool completed;
+        uint256 steps;
+        uint256 pendingAfterFirst;
+        while (!completed) {
+            (, uint256 doneBefore,) = realm.settlementProgress();
+            completed = realm.settleStep(budget);
+            steps += 1;
+            (bool started, uint256 done,) = realm.settlementProgress();
+            uint256 pendingNow = _totalPendingIncome();
+            if (steps == 1) pendingAfterFirst = pendingNow;
+            else assertEq(pendingNow, pendingAfterFirst, "income distributed more than once");
+            if (completed) break;
+            assertTrue(started);
+            assertGe(done, doneBefore, "tile progress went backwards");
+            assertEq(realm.settledEpochs(), epoch, "partial step advanced settledEpochs");
+            // One interleaved action per step, chosen by the seed.
+            seed = uint256(keccak256(abi.encode(seed, steps)));
+            address a = _actor(seed);
+            uint256 g = guilds.guildOf(a);
+            uint256 choice = (seed >> 8) % 3;
+            if (choice == 0 && g != 0) {
+                uint256 n = 1 + (seed >> 16) % 5;
+                vm.prank(a);
+                realm.buyTroops(n);
+                boughtDuring += n;
+                balanceDelta += int256(n * PRICE - n * PRICE * FEE_BPS / 10_000);
+                ghostTroopsBought += n;
+                ghostPaidIn += n * PRICE;
+            } else if (choice == 1 && g != 0) {
+                uint256 got = realm.collectIncome(g);
+                assertEq(realm.pendingIncome(g), 0);
+                pendingAfterFirst -= got;
+                balanceDelta -= int256(got);
+            } else if (choice == 2 && g != 0 && realm.reserveOf(g) != 0) {
+                uint256 tile = (seed >> 24) % 4;
+                (uint256 holder,) = realm.tile(tile);
+                if (
+                    holder != g && !_alreadyAttacking(g, tile)
+                        && !diplomacy.wouldBreakPact(g, holder, realm.currentEpoch())
+                ) {
+                    vm.prank(a);
+                    uint256 pid = guilds.propose(Guilds.Kind.Attack, address(realm), 0, tile, holder, 1);
+                    if (guilds.isApproved(pid)) realm.declareAttack(pid);
+                }
+            }
+        }
+        assertGe(steps, 1);
+    }
+
+    function _totalPendingIncome() internal view returns (uint256 total) {
+        total = realm.incomeCarry();
+        for (uint256 g = 1; g <= guilds.guildCount(); ++g) {
+            total += realm.pendingIncome(g);
+        }
+    }
+
+    /// @dev After an epoch resolves: a tile only changes hands to an attacker that named its holder,
+    ///      a tile nobody attacked under its real holder is untouched, and a held tile stays held.
+    function _checkOutcomes(TileSnapshot[] memory snaps) internal view {
+        for (uint256 i; i < snaps.length; ++i) {
+            TileSnapshot memory s = snaps[i];
+            (uint256 holder, uint256 garrison) = realm.tile(s.tile);
+            bool anyValid;
+            bool holderIsNamedAttacker;
+            for (uint256 k; k < s.attacks.length; ++k) {
+                Realm.Attack memory a = s.attacks[k];
+                if (a.expectedHolder != s.holder) continue;
+                anyValid = true;
+                if (a.attacker == holder) holderIsNamedAttacker = true;
+            }
+            if (!anyValid) {
+                assertEq(holder, s.holder, "a tile changed hands with only void attacks");
+                assertEq(garrison, s.garrison, "a tile lost garrison to void attacks");
+            } else {
+                assertTrue(holder == s.holder || holderIsNamedAttacker, "tile fell to a guild that did not name it");
+            }
+            if (s.holder != 0) {
+                assertTrue(holder != 0, "a held tile became empty");
+                assertGe(garrison, 1);
+                if (holder == s.holder) assertLe(garrison, s.garrison, "a defender gained troops");
+            }
+        }
     }
 
     function collectIncome(uint256 guildSeed) external {
@@ -772,6 +961,10 @@ contract PactsInvariantTest is Test {
     function invariant_settlementNeverRunsAhead() public view {
         uint256 settled = realm.settledEpochs();
         assertLe(settled, realm.currentEpoch());
+        assertEq(settled, handler.ghostSettled(), "settledEpochs moved outside a settlement call");
+        (bool started, uint256 done,) = realm.settlementProgress();
+        assertFalse(started, "a settlement was left half done");
+        assertEq(done, 0);
         for (uint256 s; s <= realm.currentSeason(); ++s) {
             (,, bool recorded) = realm.standingsOf(s);
             assertEq(recorded, settled >= (s + 1) * EPOCHS_PER_SEASON);
