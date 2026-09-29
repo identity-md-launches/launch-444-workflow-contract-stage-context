@@ -1,0 +1,33 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Pact",
+    "symbol": "PACT",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "Guilds",
+      "constructorArgs": ["$token", "3600"]
+    },
+    {
+      "contract": "Realm",
+      "constructorArgs": [
+        "$token",
+        "$contract:Guilds",
+        "3600",
+        "604800",
+        "1000000000000000000",
+        "500"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Pacts on Sepolia uses Pact (PACT). Deploy Guilds before Realm. Realm creates Diplomacy and Season in its constructor; Season creates Banners, whose sole minter is Season. Discover these child contracts through Realm.diplomacy(), Realm.season() and Season.banners(); they are not separate factory deployments. Guilds and Realm use 3600-second epochs; Realm uses 604800-second seasons (168 epochs), a troop price of 1000000000000000000 token units (1 PACT) and a season fee of 500 basis points (5%), matching the accepted deployment defaults. No owner argument, initialization call or constructor ETH is required. Game payouts are funded by player payments. The pool pairs with native ETH and has no hook; initialPrice is decimal sqrtPriceX96. A pinned policy specifying an opening market cap determines the effective opening price in the deployer. Policy and signed artifact linkage are supplied by services."
+}
