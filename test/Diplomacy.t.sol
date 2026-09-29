@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {PactsBase} from "./PactsBase.t.sol";
 import {Guilds} from "../src/Guilds.sol";
+import {Realm} from "../src/Realm.sol";
 import {Diplomacy} from "../src/Diplomacy.sol";
 
 contract DiplomacyTest is PactsBase {
@@ -158,7 +159,7 @@ contract DiplomacyTest is PactsBase {
         uint256 pactId = signAB(10e18, 25e18, 5); // epochs 1..5
         buy(alice, 3);
         uint256 treasuryB = guilds.treasuryOf(gB);
-        attackNow(alice, 7, gB, 3); // Alpha betrays Beta
+        betrayNow(alice, 7, gB, 3); // Alpha betrays Beta
         // Beta receives Alpha's 10e18 bond and its own 25e18 bond back.
         assertEq(guilds.treasuryOf(gB), treasuryB + 35e18);
         assertEq(guilds.treasuryOf(gA), 90e18);
@@ -179,7 +180,7 @@ contract DiplomacyTest is PactsBase {
         capture(alice, 7, 10);
         signAB(10e18, 25e18, 5);
         buy(bob, 3);
-        attackNow(bob, 7, gA, 3);
+        betrayNow(bob, 7, gA, 3);
         // Alpha gets Beta's 25e18 bond plus its own 10e18 back.
         assertEq(guilds.treasuryOf(gA), 100e18 + 25e18);
         assertEq(guilds.treasuryOf(gB), 75e18);
@@ -221,9 +222,59 @@ contract DiplomacyTest is PactsBase {
         warpToEpoch(EPOCHS_PER_SEASON + 3);
         realm.settlePending(EPOCHS_PER_SEASON + 3);
         buy(alice, 3);
-        attackNow(alice, 7, gB, 3);
+        betrayNow(alice, 7, gB, 3);
         assertEq(diplomacy.betrayals(gA, 0), 0);
         assertEq(diplomacy.betrayals(gA, 1), 1);
+    }
+
+    function test_onlyAMemberOfTheAttackingGuildCanBreakAPact() public {
+        capture(bob, 7, 10); // Beta holds tile 7
+        uint256 pactId = signAB(10e18, 25e18, 5);
+        buy(alice, 3);
+        uint256 pid = proposeAttack(alice, 7, gB, 3);
+        assertTrue(diplomacy.wouldBreakPact(gA, gB, realm.currentEpoch()));
+        assertFalse(diplomacy.wouldBreakPact(gA, gC, realm.currentEpoch()));
+        assertFalse(diplomacy.wouldBreakPact(gA, gB, 6)); // after the pact's last epoch
+        uint256 treasuryA = guilds.treasuryOf(gA);
+        uint256 treasuryB = guilds.treasuryOf(gB);
+        // Neither the victim, an outsider nor the test contract can turn Alpha into a betrayer.
+        vm.prank(bob);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        realm.declareAttack(pid);
+        vm.prank(outsider);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        realm.declareAttack(pid);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        realm.declareAttack(pid);
+        assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Active));
+        assertEq(guilds.treasuryOf(gA), treasuryA);
+        assertEq(guilds.treasuryOf(gB), treasuryB);
+        assertEq(realm.reserveOf(gA), 3);
+        assertEq(diplomacy.betrayals(gA, 0), 0);
+        // A member who joined after the proposal cannot vote on it, but is a member and may declare.
+        join(erin, gA);
+        declareAs(erin, pid);
+        assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Broken));
+        assertEq(guilds.treasuryOf(gB), treasuryB + 35e18);
+        assertEq(diplomacy.betrayals(gA, 0), 1);
+    }
+
+    function test_anyoneMayStillDeclareAnAttackThatBreaksNoPact() public {
+        capture(bob, 7, 10);
+        capture(carol, 8, 10);
+        signAB(10e18, 25e18, 2); // epochs 2..3
+        buy(alice, 6);
+        // Not a partner: anyone declares.
+        uint256 onGamma = proposeAttack(alice, 8, gC, 3);
+        vm.prank(outsider);
+        realm.declareAttack(onGamma);
+        // Partner, but the pact has run out: anyone declares and the pact simply expires.
+        warpToEpoch(4);
+        uint256 onBeta = proposeAttack(alice, 7, gB, 3);
+        vm.prank(outsider);
+        realm.declareAttack(onBeta);
+        assertEq(uint256(diplomacy.getPact(1).status), uint256(Diplomacy.Status.Expired));
+        assertEq(diplomacy.betrayals(gA, 0), 0);
     }
 
     function test_onlyRealmMayReportAttacks() public {

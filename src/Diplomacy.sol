@@ -178,6 +178,15 @@ contract Diplomacy {
         return _activePact[lo][hi];
     }
 
+    /// @notice True if an attack by `attacker` on `defender` declared in `epoch` would break an active
+    ///         pact between them, i.e. `onAttack` would slash rather than expire it.
+    function wouldBreakPact(uint256 attacker, uint256 defender, uint256 epoch) external view returns (bool) {
+        if (attacker == 0 || defender == 0 || attacker == defender) return false;
+        (uint256 lo, uint256 hi) = attacker < defender ? (attacker, defender) : (defender, attacker);
+        uint256 pactId = _activePact[lo][hi];
+        return pactId != 0 && epoch <= _pacts[pactId].endEpoch;
+    }
+
     function _pact(uint256 pactId) internal view returns (Pact storage p) {
         if (pactId == 0 || pactId > pactCount) revert NoSuchPact();
         p = _pacts[pactId];

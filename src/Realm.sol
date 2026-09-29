@@ -12,12 +12,17 @@ import {Season} from "./Season.sol";
 ///         the pool is split equally per tile among the guilds holding tiles. Attacks are declared
 ///         openly during an epoch from an approved Attack proposal, commit troops from the guild's
 ///         reserve and name the tile's holder; all attacks on a tile resolve together when the epoch
-///         is settled. Anyone can settle an ended epoch; epochs settle in order.
+///         is settled. Anyone can settle an ended epoch; epochs settle in order, and a settlement may
+///         be split over several transactions (`settleStep`) so it fits in a block however many
+///         attacks were declared.
 ///
 ///         Resolution: the single largest force wins the tile; a tie for the largest force, or the
 ///         holder having the largest force, keeps the holder. Every participant loses troops in
 ///         proportion to the force it faced: `loss = force * (total - force) / total`. Survivors of
-///         the winner garrison the tile; other survivors return to their guild's reserve.
+///         the winner garrison the tile; other survivors return to their guild's reserve. An attack
+///         whose named holder no longer holds the tile when its epoch is resolved (an earlier epoch,
+///         settled later, changed hands) is void: it does not fight and its troops return to the
+///         reserve, so an attack can never hit a guild it did not name.
 ///
 ///         Realm creates Diplomacy and Season in its constructor and is the only caller they trust.
 ///         Nothing here is mintable or pausable and no address holds a privileged role.
@@ -31,6 +36,21 @@ contract Realm {
         uint256 attacker;
         uint256 troops;
         uint256 proposalId;
+        uint256 expectedHolder; // holder named by the proposal and checked at declaration
+    }
+
+    /// @dev Progress of the settlement of epoch `settledEpochs` when it spans several transactions.
+    struct Progress {
+        bool started; // income distributed
+        uint8 phase; // 0 = current tile not started, 1 = comparing forces, 2 = applying losses
+        bool unique; // the largest force so far is unique
+        uint256 tileIndex; // next tile of _attackedTiles[epoch]
+        uint256 cursor; // next attack of the current tile in the current phase
+        uint256 total;
+        uint256 best;
+        uint256 winner;
+        uint256 pool; // for the EpochSettled event
+        uint256 held;
     }
 
     struct Standing {
@@ -73,6 +93,7 @@ contract Realm {
     mapping(uint256 epoch => mapping(uint256 tile => mapping(uint256 guildId => bool))) internal _attacking;
     mapping(uint256 attacker => mapping(uint256 defender => uint256)) internal _lastAttackEpochPlusOne;
     mapping(uint256 season => Standing) internal _standings;
+    Progress internal _progress;
 
     event TroopsBought(
         uint256 indexed guildId, address indexed payer, uint256 troops, uint256 cost, uint256 fee, uint256 indexed epoch
@@ -87,6 +108,14 @@ contract Realm {
     );
     event AttackResolved(
         uint256 indexed epoch, uint256 indexed tile, uint256 indexed attacker, uint256 committed, uint256 lost, bool won
+    );
+    event AttackVoided(
+        uint256 indexed epoch,
+        uint256 indexed tile,
+        uint256 indexed attacker,
+        uint256 troops,
+        uint256 expectedHolder,
+        uint256 actualHolder
     );
     event TileResolved(
         uint256 indexed epoch, uint256 indexed tile, uint256 previousHolder, uint256 indexed holder, uint256 garrison
@@ -104,9 +133,11 @@ contract Realm {
     error HolderChanged(uint256 expected, uint256 actual);
     error CannotAttackOwnTile();
     error AlreadyAttacking();
+    error BetrayalRequiresMember();
     error InsufficientTroops(uint256 available, uint256 required);
     error NotWholeTroops();
     error EpochNotEnded();
+    error ZeroSteps();
     error TransferFailed();
 
     constructor(
@@ -197,6 +228,8 @@ contract Realm {
 
     /// @notice Declare the attack described by an approved Attack proposal in the current epoch.
     ///         Fails if the tile's holder is no longer the one named when the proposal was created.
+    ///         Anyone may declare an approved attack, except one that breaks an active pact: betraying
+    ///         a partner costs the guild its bond, so only a member of the attacking guild may do it.
     function declareAttack(uint256 proposalId) external returns (uint256 epoch) {
         Guilds.Proposal memory p = guilds.getProposal(proposalId);
         if (p.kind != Guilds.Kind.Attack) revert WrongKind();
@@ -210,6 +243,10 @@ contract Realm {
         if (expectedHolder == attacker) revert CannotAttackOwnTile();
         epoch = currentEpoch();
         if (_attacking[epoch][tile][attacker]) revert AlreadyAttacking();
+        if (
+            expectedHolder != 0 && diplomacy.wouldBreakPact(attacker, expectedHolder, epoch)
+                && !guilds.isMember(attacker, msg.sender)
+        ) revert BetrayalRequiresMember();
         uint256 available = reserveOf[attacker];
         if (available < troops) revert InsufficientTroops(available, troops);
 
@@ -218,7 +255,9 @@ contract Realm {
         reserveOf[attacker] = available - troops;
         _attacking[epoch][tile][attacker] = true;
         if (_attacks[epoch][tile].length == 0) _attackedTiles[epoch].push(tile);
-        _attacks[epoch][tile].push(Attack({attacker: attacker, troops: troops, proposalId: proposalId}));
+        _attacks[epoch][tile].push(
+            Attack({attacker: attacker, troops: troops, proposalId: proposalId, expectedHolder: expectedHolder})
+        );
         _lastAttackEpochPlusOne[attacker][expectedHolder] = epoch + 1;
         emit AttackDeclared(epoch, tile, attacker, expectedHolder, troops, proposalId);
         if (expectedHolder != 0) diplomacy.onAttack(attacker, expectedHolder, epoch);
@@ -226,37 +265,24 @@ contract Realm {
 
     // ----------------------------------------------------------- settlement
 
-    /// @notice Settle the next unsettled epoch, which must have ended. Anyone may call.
+    /// @notice Settle the next unsettled epoch completely, which must have ended. Anyone may call.
+    ///         Finishes a settlement that `settleStep` started.
     function settle() public returns (uint256 epoch) {
         epoch = settledEpochs;
-        if (currentEpoch() <= epoch) revert EpochNotEnded();
-
-        // 1. Income of the epoch goes to the guilds that held tiles during it.
-        uint256 pool = incomePool[epoch] + incomeCarry;
-        uint256 held = heldTiles;
-        if (held != 0 && pool != 0) {
-            uint256 perTile = pool / held;
-            accIncomePerTile += perTile;
-            incomeCarry = pool - perTile * held;
-        } else {
-            incomeCarry = pool;
-        }
-
-        // 2. All attacks declared in the epoch resolve together, tile by tile.
-        uint256[] storage attacked = _attackedTiles[epoch];
-        uint256 n = attacked.length;
-        for (uint256 i; i < n; ++i) {
-            _resolveTile(epoch, attacked[i]);
-        }
-
-        // 3. The last epoch of a season fixes the standings.
-        if ((epoch + 1) % epochsPerSeason == 0) _recordStandings(seasonOfEpoch(epoch));
-
-        settledEpochs = epoch + 1;
-        emit EpochSettled(epoch, pool, held, accIncomePerTile);
+        _settle(type(uint256).max);
     }
 
-    /// @notice Settle up to `max` ended epochs in order. Returns how many were settled.
+    /// @notice Settle the next unsettled epoch in bounded steps: visits at most `maxAttacks` attack
+    ///         entries (every attack is visited once to compare forces and once to apply losses) and
+    ///         returns whether the epoch is now settled. Income is distributed on the first step and
+    ///         standings are recorded on the last; the epoch counts as settled only when it completes.
+    ///         Keeps each transaction within a block however many attacks were declared. Anyone may call.
+    function settleStep(uint256 maxAttacks) external returns (bool completed) {
+        if (maxAttacks == 0) revert ZeroSteps();
+        return _settle(maxAttacks);
+    }
+
+    /// @notice Settle up to `max` ended epochs in order, each completely. Returns how many were settled.
     function settlePending(uint256 max) external returns (uint256 count) {
         while (count < max && currentEpoch() > settledEpochs) {
             settle();
@@ -264,60 +290,165 @@ contract Realm {
         }
     }
 
+    /// @notice Where the settlement of epoch `settledEpochs` stands: whether it has started, how many
+    ///         attacked tiles are done and the total. Zero everywhere when no settlement is in progress.
+    function settlementProgress() external view returns (bool started, uint256 tilesDone, uint256 tilesTotal) {
+        return (_progress.started, _progress.tileIndex, _attackedTiles[settledEpochs].length);
+    }
+
     uint256 internal constant NO_WINNER = type(uint256).max;
 
-    function _resolveTile(uint256 epoch, uint256 tile) internal {
+    function _settle(uint256 budget) internal returns (bool completed) {
+        uint256 epoch = settledEpochs;
+        if (currentEpoch() <= epoch) revert EpochNotEnded();
+        Progress storage pr = _progress;
+
+        // 1. Income of the epoch goes to the guilds that held tiles during it.
+        if (!pr.started) {
+            uint256 pool = incomePool[epoch] + incomeCarry;
+            uint256 held = heldTiles;
+            if (held != 0 && pool != 0) {
+                uint256 perTile = pool / held;
+                accIncomePerTile += perTile;
+                incomeCarry = pool - perTile * held;
+            } else {
+                incomeCarry = pool;
+            }
+            pr.started = true;
+            pr.pool = pool;
+            pr.held = held;
+        }
+
+        // 2. All attacks declared in the epoch resolve together, tile by tile, within the budget.
+        uint256[] storage attacked = _attackedTiles[epoch];
+        uint256 n = attacked.length;
+        while (pr.tileIndex < n) {
+            if (budget == 0) return false;
+            budget = _resolveTile(epoch, attacked[pr.tileIndex], pr, budget);
+        }
+
+        // 3. The last epoch of a season fixes the standings.
+        if ((epoch + 1) % epochsPerSeason == 0) _recordStandings(seasonOfEpoch(epoch));
+
+        settledEpochs = epoch + 1;
+        emit EpochSettled(epoch, pr.pool, pr.held, accIncomePerTile);
+        delete _progress;
+        return true;
+    }
+
+    /// @dev Resolves `tile` as far as `budget` allows and returns what is left of the budget. Advances
+    ///      `pr.tileIndex` once the tile is done.
+    function _resolveTile(uint256 epoch, uint256 tile, Progress storage pr, uint256 budget) internal returns (uint256) {
         Attack[] storage list = _attacks[epoch][tile];
         Tile storage t = _tiles[tile];
         uint256 holder = t.holder;
         uint256 defense = holder == 0 ? 0 : t.garrison;
-        (uint256 total, uint256 winner) = _pickWinner(list, defense);
 
-        uint256 newGarrison = _settleAttackers(epoch, tile, list, total, winner);
+        if (pr.phase == 0) {
+            pr.phase = 1;
+            pr.cursor = 0;
+            pr.total = defense;
+            pr.best = defense;
+            pr.winner = NO_WINNER;
+            pr.unique = true;
+        }
+        if (pr.phase == 1) {
+            budget = _compareForces(list, holder, pr, budget);
+            if (pr.phase == 1) return budget; // out of budget before the last attack
+        }
+        budget = _applyLosses(epoch, tile, list, holder, pr, budget);
+        if (pr.cursor < list.length) return budget;
+
+        uint256 total = pr.total;
+        uint256 winner = pr.winner;
         if (holder != 0) {
             uint256 survivors = defense - defense * (total - defense) / total;
             if (winner == NO_WINNER) t.garrison = uint128(survivors);
             else reserveOf[holder] += survivors;
         }
-        if (winner != NO_WINNER) _setHolder(tile, list[winner].attacker, newGarrison);
-        emit TileResolved(epoch, tile, holder, t.holder, t.garrison);
-    }
-
-    /// @dev The unique largest force wins if it is an attacker; a tie for largest keeps the holder.
-    function _pickWinner(Attack[] storage list, uint256 defense) internal view returns (uint256 total, uint256 winner) {
-        total = defense;
-        uint256 best = defense;
-        winner = NO_WINNER;
-        bool unique = true;
-        uint256 n = list.length;
-        for (uint256 i; i < n; ++i) {
-            uint256 c = list[i].troops;
-            total += c;
-            if (c > best) {
-                best = c;
-                winner = i;
-                unique = true;
-            } else if (c == best) {
-                unique = false;
-            }
+        if (winner != NO_WINNER) {
+            uint256 c = list[winner].troops;
+            _setHolder(tile, list[winner].attacker, c - c * (total - c) / total);
         }
-        if (!unique) winner = NO_WINNER;
+        emit TileResolved(epoch, tile, holder, t.holder, t.garrison);
+        pr.phase = 0;
+        pr.cursor = 0;
+        pr.tileIndex += 1;
+        return budget;
     }
 
-    /// @dev Applies proportional losses to every attacker; returns the winner's surviving garrison.
-    function _settleAttackers(uint256 epoch, uint256 tile, Attack[] storage list, uint256 total, uint256 winner)
+    /// @dev Phase 1: the unique largest force wins if it is an attacker; a tie for largest keeps the
+    ///      holder. Attacks that named a different holder are skipped. Moves to phase 2 when done.
+    function _compareForces(Attack[] storage list, uint256 holder, Progress storage pr, uint256 budget)
         internal
-        returns (uint256 newGarrison)
+        returns (uint256)
     {
+        uint256 i = pr.cursor;
         uint256 n = list.length;
-        for (uint256 i; i < n; ++i) {
+        uint256 total = pr.total;
+        uint256 best = pr.best;
+        uint256 winner = pr.winner;
+        bool unique = pr.unique;
+        while (i < n && budget != 0) {
+            Attack storage a = list[i];
+            if (a.expectedHolder == holder) {
+                uint256 c = a.troops;
+                total += c;
+                if (c > best) {
+                    best = c;
+                    winner = i;
+                    unique = true;
+                } else if (c == best) {
+                    unique = false;
+                }
+            }
+            ++i;
+            --budget;
+        }
+        pr.total = total;
+        pr.best = best;
+        pr.unique = unique;
+        if (i < n) {
+            pr.cursor = i;
+            pr.winner = winner;
+            return 0;
+        }
+        pr.winner = unique ? winner : NO_WINNER;
+        pr.phase = 2;
+        pr.cursor = 0;
+        return budget;
+    }
+
+    /// @dev Phase 2: proportional losses for every attack that fought; a full refund for every attack
+    ///      that named a holder who no longer holds the tile.
+    function _applyLosses(
+        uint256 epoch,
+        uint256 tile,
+        Attack[] storage list,
+        uint256 holder,
+        Progress storage pr,
+        uint256 budget
+    ) internal returns (uint256) {
+        uint256 i = pr.cursor;
+        uint256 n = list.length;
+        uint256 total = pr.total;
+        uint256 winner = pr.winner;
+        while (i < n && budget != 0) {
             Attack storage a = list[i];
             uint256 c = a.troops;
-            uint256 loss = c * (total - c) / total;
-            emit AttackResolved(epoch, tile, a.attacker, c, loss, i == winner);
-            if (i == winner) newGarrison = c - loss;
-            else reserveOf[a.attacker] += c - loss;
+            if (a.expectedHolder != holder) {
+                reserveOf[a.attacker] += c;
+                emit AttackVoided(epoch, tile, a.attacker, c, a.expectedHolder, holder);
+            } else {
+                uint256 loss = c * (total - c) / total;
+                emit AttackResolved(epoch, tile, a.attacker, c, loss, i == winner);
+                if (i != winner) reserveOf[a.attacker] += c - loss;
+            }
+            ++i;
+            --budget;
         }
+        pr.cursor = i;
+        return budget;
     }
 
     function _setHolder(uint256 tile, uint256 newHolder, uint256 garrison) internal {

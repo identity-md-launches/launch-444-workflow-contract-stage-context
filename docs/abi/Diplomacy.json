@@ -232,6 +232,35 @@
     "stateMutability": "view"
   },
   {
+    "type": "function",
+    "name": "wouldBreakPact",
+    "inputs": [
+      {
+        "name": "attacker",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "defender",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "epoch",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
     "type": "event",
     "name": "PactBroken",
     "inputs": [

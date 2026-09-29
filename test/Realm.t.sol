@@ -114,6 +114,7 @@ contract RealmTest is PactsBase {
         assertEq(list[0].attacker, gA);
         assertEq(list[0].troops, 6);
         assertEq(list[0].proposalId, pid);
+        assertEq(list[0].expectedHolder, 0);
         assertEq(realm.attackedTilesIn(0).length, 1);
         assertTrue(guilds.getProposal(pid).executed);
         // The consumed proposal cannot be replayed, and a second attack on the same tile in the same
@@ -275,6 +276,172 @@ contract RealmTest is PactsBase {
         assertEq(realm.reserveOf(gB), 8);
         assertEq(realm.tilesHeldBy(gA), 2);
         assertEq(realm.heldTiles(), 2);
+    }
+
+    /// @dev Settlement lags: an attack declared against the storage holder X in epoch 2 must not fight
+    ///      whoever took the tile when epoch 1 settles. It is void and its troops come back.
+    function test_attackIsVoidWhenAnEarlierEpochChangesTheHolderFirst() public {
+        capture(alice, 7, 10); // epoch 0: Alpha takes tile 7; settled at epoch 1
+        buy(bob, 100);
+        attackNow(bob, 7, gA, 100); // epoch 1: Beta attacks Alpha, nobody settles
+        nextEpoch(); // epoch 2: storage still says Alpha holds tile 7
+        buy(carol, 200);
+        uint256 pid = attackNow(carol, 7, gA, 200);
+        assertEq(realm.reserveOf(gC), 0);
+        nextEpoch();
+        vm.expectEmit(true, true, true, true);
+        emit Realm.AttackVoided(2, 7, gC, 200, gA, gB);
+        realm.settlePending(2);
+        // Epoch 1: Beta takes the tile (loses 100*10/110 = 9). Epoch 2: Gamma's attack is void.
+        assertEq(tileHolder(7), gB);
+        assertEq(tileGarrison(7), 91);
+        assertEq(realm.reserveOf(gC), 200);
+        assertEq(realm.tilesHeldBy(gC), 0);
+        assertTrue(guilds.getProposal(pid).executed); // the proposal was spent all the same
+        assertFalse(realm.hasPendingAttack(gC, gA));
+        assertTroopsConserved(10 + 100 + 200, 9 + 9);
+    }
+
+    function test_voidAttacksDoNotChangeTheOutcomeForTheOthers() public {
+        capture(alice, 7, 10); // settled at epoch 1
+        uint256 gD = found(dave, "Delta");
+        buy(bob, 100);
+        buy(carol, 100);
+        buy(dave, 30);
+        attackNow(bob, 7, gA, 100); // epoch 1, unsettled
+        nextEpoch(); // epoch 2
+        attackNow(carol, 7, gA, 100); // names Alpha: void once Beta holds the tile
+        realm.settle(); // epoch 1 settles: Beta holds tile 7 with 91
+        attackNow(dave, 7, gB, 30); // names Beta: fights alone against the garrison of 91
+        nextEpoch();
+        realm.settle();
+        // total 121: Delta loses 30*91/121 = 22, Beta loses 91*30/121 = 22.
+        assertEq(tileHolder(7), gB);
+        assertEq(tileGarrison(7), 69);
+        assertEq(realm.reserveOf(gD), 8);
+        assertEq(realm.reserveOf(gC), 100);
+    }
+
+    function test_attackOnAnEmptyTileIsVoidOnceItIsHeld() public {
+        buy(alice, 10);
+        buy(bob, 10);
+        attackNow(alice, 5, 0, 10); // epoch 0
+        nextEpoch();
+        attackNow(bob, 5, 0, 10); // epoch 1, tile still empty in storage
+        nextEpoch();
+        realm.settlePending(2);
+        assertEq(tileHolder(5), gA);
+        assertEq(tileGarrison(5), 10);
+        assertEq(realm.reserveOf(gB), 10);
+    }
+
+    // ------------------------------------------------- stepwise settlement
+
+    function test_settleStepResolvesInBoundedStepsWithTheSameResult() public {
+        capture(alice, 7, 10); // holder Alpha, garrison 10
+        buy(bob, 21);
+        buy(carol, 5);
+        attackNow(bob, 7, gA, 20);
+        attackNow(carol, 7, gA, 5);
+        attackNow(bob, 8, 0, 1);
+        buy(carol, 30); // income of epoch 1 goes to Alpha's one tile
+        nextEpoch();
+        assertFalse(realm.settleStep(1)); // income + compares Beta's force
+        (bool started, uint256 done, uint256 total) = realm.settlementProgress();
+        assertTrue(started);
+        assertEq(done, 0);
+        assertEq(total, 2);
+        assertEq(realm.settledEpochs(), 1);
+        // Epoch 0 carry 9.5e18 plus epoch 1 purchases (21 + 5 + 30 troops, 95% income) = 62.7e18.
+        assertEq(realm.pendingIncome(gA), 62.7e18);
+        assertEq(tileHolder(7), gA); // nothing resolved yet
+        assertFalse(realm.settleStep(1)); // compares Gamma's force
+        assertFalse(realm.settleStep(1)); // applies Beta's losses
+        assertEq(tileHolder(7), gA);
+        assertFalse(realm.settleStep(1)); // applies Gamma's losses and finishes tile 7
+        assertEq(tileHolder(7), gB);
+        assertEq(tileGarrison(7), 12);
+        (, done,) = realm.settlementProgress();
+        assertEq(done, 1);
+        assertEq(realm.settledEpochs(), 1);
+        assertTrue(realm.settleStep(5)); // tile 8 and completion
+        assertEq(realm.settledEpochs(), 2);
+        (started, done, total) = realm.settlementProgress();
+        assertFalse(started);
+        assertEq(done, 0);
+        assertEq(total, 0);
+        assertEq(tileHolder(8), gB);
+        assertEq(realm.reserveOf(gA), 3);
+        assertEq(realm.reserveOf(gC), 31);
+        assertTroopsConserved(10 + 21 + 5 + 30, 8 + 7 + 4);
+        vm.expectRevert(Realm.EpochNotEnded.selector);
+        realm.settleStep(1);
+        vm.expectRevert(Realm.ZeroSteps.selector);
+        realm.settleStep(0);
+    }
+
+    function test_settleFinishesWhatSettleStepStarted() public {
+        capture(alice, 7, 10);
+        buy(bob, 20);
+        buy(carol, 5);
+        attackNow(bob, 7, gA, 20);
+        attackNow(carol, 7, gA, 5);
+        nextEpoch();
+        assertFalse(realm.settleStep(1));
+        assertEq(realm.settle(), 1);
+        assertEq(realm.settledEpochs(), 2);
+        assertEq(tileHolder(7), gB);
+        assertEq(tileGarrison(7), 12);
+    }
+
+    function test_standingsRecordedOnTheLastStepOfTheSeason() public {
+        buy(alice, 10);
+        buy(bob, 10);
+        warpToEpoch(EPOCHS_PER_SEASON - 1);
+        realm.settlePending(EPOCHS_PER_SEASON);
+        attackNow(alice, 0, 0, 10);
+        attackNow(bob, 1, 0, 10);
+        warpToEpoch(EPOCHS_PER_SEASON);
+        assertFalse(realm.settleStep(1));
+        (,, bool recorded) = realm.standingsOf(0);
+        assertFalse(recorded);
+        assertTrue(realm.settleStep(3));
+        (uint256[3] memory ids,, bool done) = realm.standingsOf(0);
+        assertTrue(done);
+        assertEq(ids[0], gA);
+        assertEq(ids[1], gB);
+    }
+
+    /// @dev One address founds, arms, attacks and leaves in a loop; settlement still fits in steps.
+    function test_manyAttacksOnOneTileSettleInBoundedSteps() public {
+        capture(alice, 0, 50);
+        uint256 spam = 300;
+        vm.startPrank(outsider);
+        for (uint256 i; i < spam; ++i) {
+            guilds.found("g");
+            realm.buyTroops(1);
+            uint256 pid = guilds.propose(Guilds.Kind.Attack, address(realm), 0, 0, gA, 1);
+            realm.declareAttack(pid);
+            guilds.leave();
+        }
+        vm.stopPrank();
+        nextEpoch();
+        uint256 steps;
+        bool completed;
+        while (!completed) {
+            uint256 before = gasleft();
+            completed = realm.settleStep(50);
+            assertLt(before - gasleft(), 3_000_000, "step exceeds its gas bound");
+            steps += 1;
+        }
+        assertEq(steps, 12); // 300 compares + 300 applies, 50 per step
+        assertEq(realm.settledEpochs(), 2);
+        // 300 one-troop attacks against 50: the holder keeps the tile and loses 50*300/350 = 42.
+        assertEq(tileHolder(0), gA);
+        assertEq(tileGarrison(0), 8);
+        // Each attacker loses 1*349/350 = 0 and gets its troop back.
+        assertEq(realm.reserveOf(gC + 1), 1);
+        assertEq(realm.reserveOf(gC + spam), 1);
     }
 
     function test_pendingAttackFlagClearsAtSettlement() public {

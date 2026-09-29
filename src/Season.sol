@@ -14,7 +14,8 @@ import {Banners} from "./Banners.sol";
 ///         50/30/20 of the pool, each share split equally among the members the guild had at season
 ///         end. Members claim their share and receive a Winner banner. Any guild that existed at season
 ///         end and broke no pact during the season can have a Peace banner minted to the Guilds
-///         contract on its behalf. Shares that have no winner or no members roll into the next season.
+///         contract on its behalf. Shares that have no winner or no members roll into the next season;
+///         seasons close in order so that the next season's pool is always still open.
 ///
 ///         Created by Realm in its constructor; creates Banners in its own constructor.
 contract Season {
@@ -58,6 +59,7 @@ contract Season {
     error SeasonNotEnded();
     error SeasonNotRecorded();
     error SeasonAlreadyClosed();
+    error PreviousSeasonNotClosed();
     error SeasonNotClosed();
     error NotAWinner();
     error NotMemberAtSeasonEnd();
@@ -81,10 +83,12 @@ contract Season {
     }
 
     /// @notice Close an ended season. Anyone may call once Realm has settled the season's last epoch.
+    ///         Seasons close in order, so the rollover of each season lands in a pool that is still open.
     function close(uint256 season) external {
         if (realm.currentSeason() <= season) revert SeasonNotEnded();
         Result storage r = _results[season];
         if (r.closed) revert SeasonAlreadyClosed();
+        if (season != 0 && !_results[season - 1].closed) revert PreviousSeasonNotClosed();
         (uint256[3] memory ids, uint256[3] memory tiles, bool recorded) = realm.standingsOf(season);
         if (!recorded) revert SeasonNotRecorded();
 

@@ -100,6 +100,18 @@ abstract contract PactsBase is Test {
         realm.declareAttack(pid);
     }
 
+    /// @dev Declare an approved attack as `who` (a member must declare an attack that breaks a pact).
+    function declareAs(address who, uint256 pid) internal returns (uint256 epoch) {
+        vm.prank(who);
+        epoch = realm.declareAttack(pid);
+    }
+
+    /// @dev Betray with a single-member guild: propose and declare as the member.
+    function betrayNow(address who, uint256 tile, uint256 holder, uint256 troops) internal returns (uint256 pid) {
+        pid = proposeAttack(who, tile, holder, troops);
+        declareAs(who, pid);
+    }
+
     /// @dev Give a single-member guild `troops` on `tile` by attacking an empty tile and settling.
     function capture(address who, uint256 tile, uint256 troops) internal {
         buy(who, troops);

@@ -492,6 +492,11 @@
   },
   {
     "type": "error",
+    "name": "PreviousSeasonNotClosed",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "SeasonAlreadyClosed",
     "inputs": []
   },

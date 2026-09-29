@@ -53,10 +53,12 @@ contract FundsSafetyTest is PactsBase {
         diplomacy.sign(pa, pb);
         checkAccounting();
 
-        // Alpha betrays Beta: Beta's treasury receives both bonds.
+        // Alpha betrays Beta: Beta's treasury receives both bonds. A member of Alpha must declare it.
         pid = proposeAttack(alice, 1, gB, 20);
         voteYes(dave, pid);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
         realm.declareAttack(pid);
+        declareAs(dave, pid);
         checkAccounting();
         nextEpoch();
         realm.settle();

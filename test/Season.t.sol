@@ -280,6 +280,30 @@ contract SeasonTest is PactsBase {
         assertEq(r.guildPrize[0], 0.625e18);
     }
 
+    function test_seasonsCloseInOrderSoRolloverIsNeverStranded() public {
+        capture(carol, 5, 10); // only Gamma holds a tile: half of every pool rolls over
+        buy(alice, 20); // 1e18 of fees in season 0 (plus 0.5e18 from the capture)
+        warpToEpoch(2 * EPOCHS_PER_SEASON);
+        realm.settlePending(2 * EPOCHS_PER_SEASON);
+        vm.expectRevert(Season.PreviousSeasonNotClosed.selector);
+        season.close(1);
+        season.close(0);
+        season.close(1);
+        Season.Result memory r0 = season.getResult(0);
+        Season.Result memory r1 = season.getResult(1);
+        assertEq(r0.pool, 1.5e18);
+        assertEq(r0.rollover, 0.75e18);
+        assertEq(r1.pool, 0.75e18);
+        assertEq(r1.rollover, 0.375e18);
+        assertEq(season.prizePool(2), 0.375e18);
+        assertEq(token.balanceOf(address(season)), r0.guildPrize[0] + r1.guildPrize[0] + season.prizePool(2));
+        // Season 2 can be closed only after both, and season 3 waits for it in turn.
+        warpToEpoch(3 * EPOCHS_PER_SEASON);
+        realm.settlePending(EPOCHS_PER_SEASON);
+        season.close(2);
+        assertEq(season.getResult(2).pool, 0.375e18);
+    }
+
     // ------------------------------------------------------- peace banners
 
     function test_peaceBannerForGuildWithoutBetrayal() public {
@@ -307,7 +331,7 @@ contract SeasonTest is PactsBase {
         buy(alice, 1);
         uint256 attack = proposeAttack(alice, 7, gB, 1);
         voteYes(dave, attack);
-        realm.declareAttack(attack);
+        declareAs(alice, attack);
         assertEq(diplomacy.betrayals(gA, 0), 1);
 
         vm.expectRevert(Season.SeasonNotEnded.selector);
