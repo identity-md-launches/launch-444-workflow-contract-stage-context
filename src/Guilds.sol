@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {IERC20} from "./interfaces/IERC20.sol";
+import {IRealm} from "./interfaces/IRealm.sol";
 
 /// @title Guilds: membership, one-member-one-vote proposals and pooled treasuries
 /// @notice Anyone can found or join a guild. Every action that spends a guild's pooled treasury,
@@ -21,7 +22,7 @@ contract Guilds {
         Payout, // target = recipient, amount = tokens paid from the treasury
         TreasuryTroops, // target = Realm, amount = tokens spent on troops
         Attack, // target = Realm, data1 = tile, data2 = expected holder guild, data3 = troops
-        Pact // target = Diplomacy, amount = bond, data1 = other guild, data2 = epochs
+        Pact // target = Diplomacy, amount = bond, data1 = other guild, data2 = epochs, data3 = minimum counter-bond
     }
 
     struct Guild {
@@ -214,6 +215,8 @@ contract Guilds {
             if (amount == 0) revert InvalidProposal();
         } else if (kind == Kind.Attack) {
             if (amount != 0 || data3 == 0) revert InvalidProposal();
+            (uint256 holder,) = IRealm(target).tile(data1);
+            if (holder != data2) revert InvalidProposal();
         } else if (kind == Kind.Pact) {
             if (amount == 0 || data2 == 0) revert InvalidProposal();
             if (data1 == 0 || data1 > guildCount || data1 == guildId) revert InvalidProposal();

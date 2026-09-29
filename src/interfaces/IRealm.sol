@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-/// @notice The Realm surface that Diplomacy and Season read. Realm creates both in its constructor,
-///         so they learn its address as `msg.sender` and never call it during construction.
+/// @notice The Realm surface read by Guilds, Diplomacy and Season. Realm creates Diplomacy and Season
+///         in its constructor, so they learn its address as `msg.sender` and never call it then.
 interface IRealm {
+    function tile(uint256 tileId) external view returns (uint256 holder, uint256 garrison);
     function genesis() external view returns (uint256);
     function epochLength() external view returns (uint256);
     function seasonLength() external view returns (uint256);

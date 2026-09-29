@@ -7,7 +7,8 @@ import {Guilds} from "./Guilds.sol";
 
 /// @title Diplomacy: pacts backed by token bonds
 /// @notice Two guilds sign a pact by each passing a matching Pact proposal that names this contract
-///         as target and commits a non-zero bond from the guild treasury. The pact covers a fixed
+///         as target, commits a non-zero bond from the guild treasury and specifies a minimum
+///         counter-bond in data3 (zero accepts any non-zero bond). The pact covers a fixed
 ///         number of epochs starting with the epoch it is signed in. If a guild declares an attack on
 ///         a pact partner's tile while the pact is active, Realm reports it here at once and the
 ///         attacker's bond is paid to the victim's treasury together with the victim's own bond. A
@@ -106,6 +107,7 @@ contract Diplomacy {
         if (a.guildId == b.guildId) revert SameGuild();
         // Each side names the other and both agree on the duration (data2 = epochs).
         if (a.data1 != b.guildId || b.data1 != a.guildId || a.data2 != b.data2) revert ProposalsDoNotMatch();
+        if (b.amount < a.data3 || a.amount < b.data3) revert ProposalsDoNotMatch();
         (uint256 lo, uint256 hi) = a.guildId < b.guildId ? (a.guildId, b.guildId) : (b.guildId, a.guildId);
         if (_activePact[lo][hi] != 0) revert PactAlreadyActive();
         if (realm.hasPendingAttack(a.guildId, b.guildId) || realm.hasPendingAttack(b.guildId, a.guildId)) {

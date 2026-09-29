@@ -80,14 +80,13 @@ contract RealmTest is PactsBase {
         uint256 payout = guilds.propose(Guilds.Kind.Payout, alice, 1, 0, 0, 0);
         vm.expectRevert(Realm.WrongKind.selector);
         realm.declareAttack(payout);
-        // bad tile
-        uint256 bad = proposeAttack(alice, 144, 0, 1);
+        // Bad tiles and incorrect proposal-time holders now fail at proposal creation.
+        vm.prank(alice);
         vm.expectRevert(Realm.InvalidTile.selector);
-        realm.declareAttack(bad);
-        // holder changed (tile is empty, proposal named Beta)
-        uint256 stale = proposeAttack(alice, 3, gB, 1);
-        vm.expectRevert(abi.encodeWithSelector(Realm.HolderChanged.selector, gB, 0));
-        realm.declareAttack(stale);
+        guilds.propose(Guilds.Kind.Attack, address(realm), 0, 144, 0, 1);
+        vm.prank(alice);
+        vm.expectRevert(Guilds.InvalidProposal.selector);
+        guilds.propose(Guilds.Kind.Attack, address(realm), 0, 3, gB, 1);
         // not enough troops
         uint256 big = proposeAttack(alice, 3, 0, 11);
         vm.expectRevert(abi.encodeWithSelector(Realm.InsufficientTroops.selector, 10, 11));
@@ -97,12 +96,10 @@ contract RealmTest is PactsBase {
         uint256 unapproved = proposeAttack(alice, 3, 0, 1);
         vm.expectRevert(Guilds.ProposalNotApproved.selector);
         realm.declareAttack(unapproved);
-        // proposal whose target is not Realm cannot be consumed by Realm
+        // A target without the tile view cannot supply a proposal-time holder.
         vm.prank(alice);
-        uint256 wrongTarget = guilds.propose(Guilds.Kind.Attack, address(diplomacy), 0, 3, 0, 1);
-        voteYes(dave, wrongTarget);
-        vm.expectRevert(Guilds.NotTarget.selector);
-        realm.declareAttack(wrongTarget);
+        vm.expectRevert();
+        guilds.propose(Guilds.Kind.Attack, address(diplomacy), 0, 3, 0, 1);
     }
 
     function test_attackConsumesProposalAndCommitsTroops() public {

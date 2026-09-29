@@ -8,6 +8,13 @@ partner. Seasons pay the top guilds and mint trophy NFTs.
 There is no randomness, no hidden information and **no admin power anywhere**: no owner, pauser,
 minter, upgrader or fee switch. Every token the game ever pays out was paid in by a player.
 
+**Open membership permits treasury and prize capture.** Any guild treasury is capturable by whoever
+brings enough wallets to form a majority, even if none of those wallets funded it or were admitted
+by existing members. Wallets joining in the final second of a season also receive equal prize
+shares and Winner banners. These risks follow the approved permissionless membership and season-end
+snapshot rules; this revision preserves those rules. The game provides no identity or admission
+protection for player funds.
+
 ## Contracts
 
 | Contract | File | Role |
@@ -83,6 +90,11 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
 - Anyone can found a guild (name of 1–32 bytes) or join an existing one. An address is in at most one
   guild at a time and may leave at any time. Leaving forfeits nothing personally; the treasury is
   pooled and stays with the guild.
+- Expulsion ends the current membership stint, but is **not a ban or cooldown**. The expelled address
+  can rejoin in the same block. Its new join sequence prevents voting on older proposals, but it
+  counts in later proposal denominators and can vote on them. Rejoining before season end restores
+  an equal prize share. Expulsion therefore cannot reliably exclude an address from the guild or
+  its prizes under these open-join rules.
 - A proposal is created by a member and carries a kind, a `target` address, a treasury `amount`
   and three data words. The proposer's yes vote is cast at creation.
 - Only members who joined **before the proposal was created** may vote (tracked by a per-guild join
@@ -100,7 +112,7 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
 | `Payout` | `target` = recipient, `amount` | `Guilds.execute` — transfers from the treasury |
 | `TreasuryTroops` | `target` = Realm, `amount` | `Realm.buyTroopsFromTreasury` |
 | `Attack` | `target` = Realm, `data1` = tile, `data2` = holder guild at proposal time, `data3` = troops | `Realm.declareAttack` |
-| `Pact` | `target` = Diplomacy, `amount` = bond, `data1` = other guild, `data2` = epochs | `Diplomacy.sign` |
+| `Pact` | `target` = Diplomacy, `amount` = bond, `data1` = other guild, `data2` = epochs, `data3` = minimum counter-bond | `Diplomacy.sign` |
 
 - Spending the pooled treasury (payout, troops, bond) always goes through a proposal, and Guilds
   releases the `amount` only to the `target` the majority approved, once. **Voters must check the
@@ -119,6 +131,9 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
 
 ### Attacks and settlement
 
+- `Guilds.propose(Attack, ...)` reads `tile(data1)` from the named Realm and requires its current
+  holder to equal `data2`. A predicted future holder cannot be pre-approved while another guild
+  holds the tile. Invalid tile IDs fail at creation as well.
 - `Realm.declareAttack(proposalId)` (anyone, once the proposal is approved) commits the proposal's
   troops from the guild reserve to the named tile in the **current** epoch. It fails if the tile's
   holder differs from the holder named when the proposal was created, if the guild would attack its
@@ -151,14 +166,26 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
     empty tile leave it empty.
   - every participant loses `force × (T − force) / T` troops (integer division). The winner's
     survivors become the garrison; every other side's survivors return to their guild reserve.
+- Losses round down, with **no minimum casualty**. This retained rounding rule means a one-troop
+  force never loses its troop, a two-troop attacker captures a one-troop garrison with no casualties
+  on either side, and a one-troop attack against 999 defenders costs neither side a troop. After
+  the initial purchase, a surviving troop can be reused every epoch. Such attacks still cost gas
+  and create pending attacks that block pacts until settled; keepers also bear settlement gas.
 - Garrisons cannot be reinforced; the only way to add troops to a tile is to retake it.
 
 ### Pacts
 
-- Each guild passes a `Pact` proposal naming the other guild, its own non-zero bond and the number of
-  epochs. `Diplomacy.sign(proposalA, proposalB)` (anyone) checks that they name each other with the
-  same length, that no pact is already active between the two, and that neither guild has an attack
-  on the other in an epoch that is not yet settled. Both bonds are pulled from the treasuries.
+- Each guild passes a `Pact` proposal naming the other guild, its own non-zero bond, the number of
+  epochs and the minimum bond required from its partner (`data3`, in token minor units).
+  `Diplomacy.sign(proposalA, proposalB)` (anyone) checks that they name each other with the same
+  length, that each bond meets the other proposal's minimum, that no pact is already active between
+  the two, and that neither guild has an attack on the other in an epoch that is not yet settled.
+  Both minima are checked before either proposal is consumed or either treasury is debited.
+- Bonds may differ if both approved minima permit it. **A zero minimum accepts any non-zero
+  counter-bond, including 1 wei**; that partner can then betray for just 1 wei even when the other
+  guild locked 1000 PACT. Set `data3 = amount` to require at least the same bond, or explicitly vote
+  for another minimum. Approved proposals remain open offers until consumed or expired at the end
+  of epoch E+1; they cannot be cancelled. This revision adds bond constraints, not cancellation.
 - The pact covers epochs `[signing epoch, signing epoch + epochs − 1]`.
 - If a guild declares an attack on a tile held by its partner during that window, Realm reports it
   in the same transaction and Diplomacy pays the attacker's bond **and** the victim's own bond into
@@ -182,6 +209,11 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
   with no members, and division dust roll into the next season's pool. Seasons close **in order**
   (`PreviousSeasonNotClosed`), so the pool a rollover lands in is always still open; Realm records
   standings in order, so every closable season has closable predecessors.
+- There is no minimum tenure or contribution requirement. Nine wallets joining a winning guild
+  with one original member at `seasonEnd - 1` receive nine tenths of its prize and nine Winner
+  banners. For a 50 PACT pool, the first-place share is 25 PACT: 22.5 PACT goes to those nine
+  wallets and 2.5 PACT to the original member. Joining at `seasonEnd` itself is too late. These
+  are fixed snapshot rules, not protection against last-second wallet dilution.
 - `Season.claim(season, guild)` pays the caller's share if they were a member of that guild at
   season end (`Guilds.wasMemberAt`; joining later earns nothing, leaving later loses nothing) and
   mints a Winner banner with the rank. One claim per member per guild per season.
@@ -224,6 +256,12 @@ Nothing needs an operator, but somebody has to send the permissionless transacti
 - **Close seasons and claim**: `Season.close(season)` after the season's last epoch is settled, in
   season order, then each winning member calls `Season.claim`, and anyone calls
   `Season.mintPeaceBanner` for eligible guilds.
+- **Present membership and bond risks**: the frontend must make the open-membership treasury and
+  season-prize risks visible before players fund a guild or buy troops. Pact voting must display
+  the offered bond and minimum counter-bond; use the offered bond as the initial minimum, and make
+  a zero minimum an explicit choice. Services and reviewers must resolve any requested change to
+  admission or prize eligibility before deploying different rules; these immutable contracts
+  contain no operator control that could add those protections later.
 - **Publish source, attest, admit and deploy** are done by the network services after this stage.
   Explorer verification and the GitHub/IPFS publication are open items for them.
 
@@ -245,6 +283,11 @@ stepwise settlement exists so that this can only make settlement slower, never i
   excludes wallets that joined after the attack proposal, but an adversary already eligible at
   proposal creation can declare an approved betrayal. Check outstanding proposals before signing
   a pact; approval is not revoked by a later pact.
+- A majority of fresh wallets can approve a payout of the **entire treasury** to any recipient,
+  over every original member's no vote. This includes donations, tile income and returned or
+  slashed bonds. The same majority can expel original members, buy troops or sign pacts. An empty
+  guild with a remaining treasury needs only one new wallet for an immediate one-of-one majority.
+  No bond, delay or original-member consent limits this capture.
 - Membership at season end is determined from join/leave stints, so leaving and rejoining across the
   season boundary is handled exactly.
 - The peace banner is awarded to every guild that existed at season end without a betrayal, whether
@@ -266,9 +309,11 @@ stepwise settlement exists so that this can only make settlement slower, never i
   and all value flows are described above.
 - Tests are not an audit. The contracts hold player funds and must go through the independent
   adversarial review before the launch is admitted. No Slither or Mythril run was part of this
-  assignment; `forge build`, `forge test` (111 permanent tests, including fuzzing on the token) and
-  `forge fmt --check` were run, and the protected launch floor tests were exercised locally against
-  the real init code with computed CREATE2 addresses.
+  assignment. This revision runs `forge build`, `forge test` (122 permanent tests, including token
+  fuzzing) and `forge fmt --check`. The supplied hostile-join proof was run separately and reproduced
+  the treasury capture; its additional admission requirement is disputed in `.imd-responses.json`,
+  not claimed to pass. The protected launch floor tests were exercised in the prior accepted round
+  against the real init code with computed CREATE2 addresses.
 
 ## Revision history
 
@@ -291,6 +336,20 @@ Third round, after reproducing both follow-up findings:
   declare them, and attacks that break no pact remain permissionless.
 - `settlementProgress()` now returns zeros whenever no settlement is in progress, even if the
   next epoch to settle already contains attacks.
+
+Fourth round, after reproducing all six reported scenarios:
+
+- Attack proposals verify the actual holder at creation; declaration and settlement retain their
+  existing holder checks. Pact proposals now enforce each side's minimum counter-bond (`data3`).
+- The treasury-capture and last-second prize reports reproduce, but their requested admission or
+  tenure restrictions conflict with the approved open-join and season-end rules. Those requirements
+  are disputed, with the financial consequences documented above and exercised in
+  `test/RuleConsequences.t.sol`. A different membership or prize design remains a requester decision.
+- Expulsion's lack of a rejoin ban and fractional losses rounding to zero are documented explicitly,
+  using the documentation remedies offered by those reports. Neither behavior was changed.
+- `test/Revision.t.sol` covers rejection of predicted holders and insufficient counter-bonds,
+  both pact argument orders, exact minimum boundaries, successful unequal bonds and bond returns.
+  The public ABI signatures and deployment parameters are unchanged.
 
 ## Development
 
