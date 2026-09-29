@@ -56,20 +56,30 @@ contract RevisionEdgeCasesTest is PactsBase {
     }
 
     function _stepUntilDone(Realm r, uint256 budget) internal returns (uint256 steps) {
+        uint256 expectedTotal = r.attackedTilesIn(r.settledEpochs()).length;
+        {
+            (bool initiallyStarted, uint256 initiallyDone, uint256 initiallyTotal) = r.settlementProgress();
+            assertFalse(initiallyStarted);
+            assertEq(initiallyDone, 0);
+            assertEq(initiallyTotal, 0, "queued attacks are not progress before the first step");
+        }
         bool done;
         while (!done) {
             uint256 settledBefore = r.settledEpochs();
             (, uint256 tilesDoneBefore,) = r.settlementProgress();
             done = r.settleStep(budget);
             steps += 1;
-            (bool started, uint256 tilesDone,) = r.settlementProgress();
+            (bool started, uint256 tilesDone, uint256 tilesTotal) = r.settlementProgress();
             if (done) {
                 assertEq(r.settledEpochs(), settledBefore + 1, "completion advances settledEpochs by one");
                 assertFalse(started, "progress cleared on completion");
                 assertEq(tilesDone, 0);
+                assertEq(tilesTotal, 0, "completed settlement clears the total too");
             } else {
                 assertEq(r.settledEpochs(), settledBefore, "a partial step must not advance settledEpochs");
                 assertTrue(started, "a partial step leaves the settlement started");
+                assertEq(tilesTotal, expectedTotal);
+                assertLt(tilesDone, tilesTotal);
                 assertGe(tilesDone, tilesDoneBefore, "tile progress never goes backwards");
             }
         }
@@ -313,6 +323,104 @@ contract RevisionEdgeCasesTest is PactsBase {
     }
 
     // -------------------------------------------------- betrayal declaration
+
+    /// @dev The last eligible member need not vote to execute an approved betrayal. Leaving or
+    ///      joining after the snapshot removes that authority, even within the same timestamp.
+    function testFuzz_betrayalEligibilitySurvivesOnlyAnUninterruptedMembership(
+        uint8 priorStintsSeed,
+        uint8 changeSeed,
+        bool pactBeforeAttack,
+        bool executeNextEpoch
+    ) public {
+        uint256 change = bound(changeSeed, 0, 5);
+        capture(bob, 7, 10);
+        buy(alice, 3);
+        uint256 priorStints = bound(priorStintsSeed, 0, 8);
+        for (uint256 i; i < priorStints; ++i) {
+            join(erin, gA);
+            vm.prank(erin);
+            guilds.leave();
+        }
+        join(frank, gA);
+        if (change != 3) join(erin, gA);
+        uint256 pactId;
+        if (pactBeforeAttack) pactId = _signSnapshotPact(3);
+        uint256 pid = proposeAttack(alice, 7, gB, 3);
+        voteYes(frank, pid);
+        if (change != 3) assertEq(guilds.memberSeq(gA, erin), guilds.getProposal(pid).seqAtCreation);
+        assertFalse(guilds.hasVoted(pid, erin));
+        if (!pactBeforeAttack) pactId = _signSnapshotPact(3);
+
+        if (change == 1 || change == 2) {
+            vm.prank(erin);
+            guilds.leave();
+        } else if (change == 4 || change == 5) {
+            vm.prank(alice);
+            uint256 expel = guilds.propose(Guilds.Kind.Expel, erin, 0, 0, 0, 0);
+            voteYes(frank, expel);
+            guilds.execute(expel);
+        }
+        if (change == 2 || change == 3 || change == 5) join(erin, gA);
+        if (executeNextEpoch) nextEpoch();
+
+        if (change != 0) {
+            vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+            vm.prank(erin);
+            realm.declareAttack(pid);
+            assertFalse(guilds.getProposal(pid).executed);
+            assertEq(realm.reserveOf(gA), 3);
+            assertEq(realm.attacksOn(realm.currentEpoch(), 7).length, 0);
+            assertFalse(realm.hasPendingAttack(gA, gB));
+            assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Active));
+            assertEq(diplomacy.activePactBetween(gA, gB), pactId);
+            assertEq(diplomacy.betrayals(gA, 0), 0);
+            assertEq(token.balanceOf(address(diplomacy)), 18e18);
+            assertEq(guilds.treasuryOf(gA), 0);
+            assertEq(guilds.treasuryOf(gB), 0);
+            declareAs(alice, pid); // Rejection must leave the approved proposal usable.
+        } else {
+            declareAs(erin, pid);
+        }
+        assertTrue(guilds.getProposal(pid).executed);
+        assertEq(realm.reserveOf(gA), 0);
+        assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Broken));
+        assertEq(diplomacy.betrayals(gA, 0), 1);
+        assertEq(guilds.treasuryOf(gB), 18e18);
+        assertEq(token.balanceOf(address(diplomacy)), 0);
+    }
+
+    function _signSnapshotPact(uint256 duration) internal returns (uint256) {
+        vm.prank(alice);
+        guilds.deposit(gA, 7e18);
+        vm.prank(bob);
+        guilds.deposit(gB, 11e18);
+        uint256 pa = proposePact(alice, gB, 7e18, duration);
+        voteYes(frank, pa);
+        uint256 pb = proposePact(bob, gA, 11e18, duration);
+        return diplomacy.sign(pa, pb);
+    }
+
+    function test_lateMemberMayDeclareAtPactExpiryWhileAttackProposalIsStillLive() public {
+        capture(bob, 7, 10);
+        buy(alice, 3);
+        join(frank, gA);
+        uint256 pactId = _signSnapshotPact(1);
+        uint256 pid = proposeAttack(alice, 7, gB, 3);
+        voteYes(frank, pid);
+        join(erin, gA);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        vm.prank(erin);
+        realm.declareAttack(pid);
+        nextEpoch();
+        assertFalse(guilds.isExpired(pid));
+        declareAs(erin, pid);
+        assertTrue(guilds.getProposal(pid).executed);
+        assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Expired));
+        assertEq(diplomacy.betrayals(gA, 0), 0);
+        assertEq(guilds.treasuryOf(gA), 7e18);
+        assertEq(guilds.treasuryOf(gB), 11e18);
+        assertEq(token.balanceOf(address(diplomacy)), 0);
+    }
 
     /// @dev `wouldBreakPact` agrees with what `onAttack` then does, for every duration and delay, and
     ///      the member gate applies exactly while it is true.

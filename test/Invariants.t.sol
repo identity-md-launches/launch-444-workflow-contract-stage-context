@@ -43,6 +43,9 @@ contract PactsHandler is Test {
     uint256 public nextSeasonToClose;
     uint256 public ghostSettled; // settledEpochs as last observed by a settlement action
     mapping(string => uint256) public calls;
+    uint256[] internal queuedAttacks;
+    // Membership stints form an oracle independent of the proposal's join-sequence cutoff.
+    mapping(uint256 proposal => mapping(address actor => uint256 stint)) internal queuedMemberStint;
 
     constructor(
         LaunchToken token_,
@@ -332,6 +335,81 @@ contract PactsHandler is Test {
         if (pactId != 0) _checkPactAfterAttack(pactId, g, holder, w);
     }
 
+    /// @dev Keep proposals across handler calls so joins, departures, pacts and time can intervene.
+    function queueAttack(uint256 actorSeed, uint256 tileSeed, uint256 troopsSeed, uint256 voteSeed) external {
+        address a = _actor(actorSeed);
+        uint256 g = guilds.guildOf(a);
+        uint256 reserve = realm.reserveOf(g);
+        if (g == 0 || reserve == 0) return;
+        uint256 tile = bound(tileSeed, 0, 5);
+        (uint256 holder,) = realm.tile(tile);
+        if (holder == g) return;
+        vm.prank(a);
+        uint256 pid = guilds.propose(Guilds.Kind.Attack, address(realm), 0, tile, holder, bound(troopsSeed, 1, reserve));
+        for (uint256 i; i < actors.length; ++i) {
+            if (guilds.isMember(g, actors[i])) {
+                queuedMemberStint[pid][actors[i]] = guilds.stintCount(g, actors[i]);
+            }
+        }
+        _voteAll(pid, g, a, voteSeed);
+        queuedAttacks.push(pid);
+        calls["queuedAttackCreated"]++;
+    }
+
+    function declareQueuedAttack(uint256 proposalSeed, uint256 actorSeed) external {
+        if (queuedAttacks.length == 0) return;
+        uint256 pid = queuedAttacks[bound(proposalSeed, 0, queuedAttacks.length - 1)];
+        Guilds.Proposal memory p = guilds.getProposal(pid);
+        (uint256 holder,) = realm.tile(p.data1);
+        uint256 reserve = realm.reserveOf(p.guildId);
+        if (p.executed || holder != p.data2 || reserve < p.data3 || _alreadyAttacking(p.guildId, p.data1)) return;
+        address a = _actor(actorSeed);
+        uint256 pactId = diplomacy.activePactBetween(p.guildId, holder);
+        PactWatch memory w = _watchPact(pactId, p.guildId, holder);
+        uint256 stint = queuedMemberStint[pid][a];
+        bool eligible = stint != 0 && guilds.isMember(p.guildId, a) && guilds.stintCount(p.guildId, a) == stint;
+        bytes4 expectedError;
+        if (w.betrayal && !eligible) expectedError = Realm.BetrayalRequiresMember.selector;
+        else if (guilds.isExpired(pid)) expectedError = Guilds.ProposalExpired.selector;
+        else if (!guilds.isApproved(pid)) expectedError = Guilds.ProposalNotApproved.selector;
+
+        if (expectedError != bytes4(0)) {
+            bytes32 beforeState = _queuedAttackState(pid, p);
+            vm.expectRevert(expectedError);
+            vm.prank(a);
+            realm.declareAttack(pid);
+            assertEq(_queuedAttackState(pid, p), beforeState, "rejected attack changed funds or game state");
+            calls["queuedAttackRejected"]++;
+            return;
+        }
+        uint256 alive = aliveTroops();
+        vm.prank(a);
+        uint256 epoch = realm.declareAttack(pid);
+        assertEq(epoch, realm.currentEpoch());
+        assertTrue(guilds.getProposal(pid).executed);
+        assertEq(realm.reserveOf(p.guildId), reserve - p.data3);
+        assertEq(aliveTroops(), alive, "declaring a queued attack destroys no troops");
+        if (pactId != 0) _checkPactAfterAttack(pactId, p.guildId, holder, w);
+        calls["queuedAttackDeclared"]++;
+    }
+
+    function _queuedAttackState(uint256 pid, Guilds.Proposal memory p) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                guilds.getProposal(pid),
+                realm.reserveOf(p.guildId),
+                realm.attacksOn(realm.currentEpoch(), p.data1),
+                realm.hasPendingAttack(p.guildId, p.data2),
+                diplomacy.activePactBetween(p.guildId, p.data2),
+                diplomacy.betrayals(p.guildId, realm.seasonOfEpoch(realm.currentEpoch())),
+                token.balanceOf(address(diplomacy)),
+                token.balanceOf(address(guilds)),
+                guilds.treasuryOf(p.guildId),
+                guilds.treasuryOf(p.data2)
+            )
+        );
+    }
+
     struct PactWatch {
         bool betrayal;
         uint256 bonds;
@@ -456,9 +534,10 @@ contract PactsHandler is Test {
             (boughtDuring, balanceDelta) = _stepThrough(epoch, budget, interleaveSeed);
         }
         assertEq(realm.settledEpochs(), epoch + 1);
-        (bool started, uint256 done,) = realm.settlementProgress();
+        (bool started, uint256 done, uint256 total) = realm.settlementProgress();
         assertFalse(started, "progress not cleared");
         assertEq(done, 0);
+        assertEq(total, 0, "queued attacks are not settlement progress");
         _checkOutcomes(snaps);
     }
 
@@ -482,6 +561,7 @@ contract PactsHandler is Test {
             else assertEq(pendingNow, pendingAfterFirst, "income distributed more than once");
             if (completed) break;
             assertTrue(started);
+            _checkActiveProgress(epoch);
             assertGe(done, doneBefore, "tile progress went backwards");
             assertEq(realm.settledEpochs(), epoch, "partial step advanced settledEpochs");
             // One interleaved action per step, chosen by the seed.
@@ -516,6 +596,12 @@ contract PactsHandler is Test {
             }
         }
         assertGe(steps, 1);
+    }
+
+    function _checkActiveProgress(uint256 epoch) internal view {
+        (, uint256 done, uint256 total) = realm.settlementProgress();
+        assertEq(total, realm.attackedTilesIn(epoch).length, "progress must describe the epoch being settled");
+        assertLt(done, total);
     }
 
     function _totalPendingIncome() internal view returns (uint256 total) {
@@ -818,6 +904,48 @@ contract PactsInvariantTest is Test {
 
     // -------------------------------------------------------- token flows
 
+    /// @dev Reach every new handler branch deterministically as well as in random call sequences.
+    function test_queuedAttackHandlerRejectsChangedMembershipAndAllowsOriginalMember() public {
+        handler.found(0);
+        handler.found(1);
+        handler.buyTroops(1, 2);
+        handler.attack(1, 0, 2, 1);
+        handler.warp(EPOCH);
+        handler.settle(1);
+        handler.buyTroops(0, 3);
+        handler.donate(0, 1, 10e18);
+        handler.donate(1, 2, 20e18);
+        handler.join(3, 1);
+        handler.queueAttack(0, 0, 3, 1);
+        handler.pact(0, 2, 10e18, 20e18, 3);
+        assertEq(diplomacy.pactCount(), 1);
+        handler.join(2, 1);
+        handler.declareQueuedAttack(0, 2); // late member
+        handler.leave(0);
+        handler.declareQueuedAttack(0, 0); // departed proposer
+        handler.join(0, 1);
+        handler.declareQueuedAttack(0, 0); // rejoined proposer
+        assertEq(handler.calls("queuedAttackRejected"), 3);
+        assertEq(token.balanceOf(address(diplomacy)), 30e18);
+        handler.declareQueuedAttack(0, 3); // uninterrupted original member
+        assertEq(handler.calls("queuedAttackDeclared"), 1);
+        assertEq(uint256(diplomacy.getPact(1).status), uint256(Diplomacy.Status.Broken));
+        assertEq(guilds.treasuryOf(2), 30e18);
+        handler.buyTroops(0, 2);
+        handler.queueAttack(0, 1, 1, 0);
+        handler.declareQueuedAttack(1, 0); // no majority
+        handler.queueAttack(0, 1, 1, 1);
+        handler.warp(2 * EPOCH);
+        handler.declareQueuedAttack(2, 0); // approved, but expired
+        assertEq(handler.calls("queuedAttackCreated"), 3);
+        assertEq(handler.calls("queuedAttackRejected"), 5);
+        assertEq(handler.calls("queuedAttackDeclared"), 1);
+        invariant_gameHoldsExactlyWhatWasPaidIn();
+        invariant_diplomacyHoldsExactlyTheActiveBonds();
+        invariant_guildsHoldsExactlyTheTreasuries();
+        invariant_troopsAreOnlyCreatedByPurchaseAndOnlyDestroyedBySettlement();
+    }
+
     function invariant_supplyIsConserved() public view {
         uint256 total = token.balanceOf(address(this)) + token.balanceOf(address(handler));
         for (uint256 i; i < actors.length; ++i) {
@@ -962,9 +1090,10 @@ contract PactsInvariantTest is Test {
         uint256 settled = realm.settledEpochs();
         assertLe(settled, realm.currentEpoch());
         assertEq(settled, handler.ghostSettled(), "settledEpochs moved outside a settlement call");
-        (bool started, uint256 done,) = realm.settlementProgress();
+        (bool started, uint256 done, uint256 total) = realm.settlementProgress();
         assertFalse(started, "a settlement was left half done");
         assertEq(done, 0);
+        assertEq(total, 0, "idle progress exposes queued attacks");
         for (uint256 s; s <= realm.currentSeason(); ++s) {
             (,, bool recorded) = realm.standingsOf(s);
             assertEq(recorded, settled >= (s + 1) * EPOCHS_PER_SEASON);
