@@ -337,6 +337,36 @@ contract RealmTest is PactsBase {
 
     // ------------------------------------------------- stepwise settlement
 
+    function test_settlementProgressIsZeroUnlessSettlementHasStarted() public {
+        _assertNoSettlementProgress();
+        buy(alice, 3);
+        attackNow(alice, 7, 0, 1);
+        attackNow(alice, 8, 0, 1);
+        _assertNoSettlementProgress(); // Declared attacks in the current epoch are not progress.
+        nextEpoch();
+        _assertNoSettlementProgress(); // An ended epoch still needs someone to start settlement.
+        attackNow(alice, 9, 0, 1); // Queue an attack in the following epoch as well.
+
+        assertFalse(realm.settleStep(2)); // Finish one of epoch 0's two tiles.
+        (bool started, uint256 done, uint256 total) = realm.settlementProgress();
+        assertTrue(started);
+        assertEq(done, 1);
+        assertEq(total, 2);
+        assertTrue(realm.settleStep(2));
+        _assertNoSettlementProgress(); // Epoch 1 has an attack, but no settlement has started.
+        nextEpoch();
+        _assertNoSettlementProgress();
+        realm.settle();
+        _assertNoSettlementProgress();
+    }
+
+    function _assertNoSettlementProgress() internal view {
+        (bool started, uint256 done, uint256 total) = realm.settlementProgress();
+        assertFalse(started);
+        assertEq(done, 0);
+        assertEq(total, 0);
+    }
+
     function test_settleStepResolvesInBoundedStepsWithTheSameResult() public {
         capture(alice, 7, 10); // holder Alpha, garrison 10
         buy(bob, 21);

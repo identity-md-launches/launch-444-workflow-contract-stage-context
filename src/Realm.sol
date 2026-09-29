@@ -229,7 +229,8 @@ contract Realm {
     /// @notice Declare the attack described by an approved Attack proposal in the current epoch.
     ///         Fails if the tile's holder is no longer the one named when the proposal was created.
     ///         Anyone may declare an approved attack, except one that breaks an active pact: betraying
-    ///         a partner costs the guild its bond, so only a member of the attacking guild may do it.
+    ///         a partner costs the guild its bond, so the caller must still be a member of the attacking
+    ///         guild and have joined before the proposal was created (the same eligibility as voting).
     function declareAttack(uint256 proposalId) external returns (uint256 epoch) {
         Guilds.Proposal memory p = guilds.getProposal(proposalId);
         if (p.kind != Guilds.Kind.Attack) revert WrongKind();
@@ -245,7 +246,7 @@ contract Realm {
         if (_attacking[epoch][tile][attacker]) revert AlreadyAttacking();
         if (
             expectedHolder != 0 && diplomacy.wouldBreakPact(attacker, expectedHolder, epoch)
-                && !guilds.isMember(attacker, msg.sender)
+                && (!guilds.isMember(attacker, msg.sender) || guilds.memberSeq(attacker, msg.sender) > p.seqAtCreation)
         ) revert BetrayalRequiresMember();
         uint256 available = reserveOf[attacker];
         if (available < troops) revert InsufficientTroops(available, troops);
@@ -293,6 +294,7 @@ contract Realm {
     /// @notice Where the settlement of epoch `settledEpochs` stands: whether it has started, how many
     ///         attacked tiles are done and the total. Zero everywhere when no settlement is in progress.
     function settlementProgress() external view returns (bool started, uint256 tilesDone, uint256 tilesTotal) {
+        if (!_progress.started) return (false, 0, 0);
         return (_progress.started, _progress.tileIndex, _attackedTiles[settledEpochs].length);
     }
 

@@ -227,7 +227,7 @@ contract DiplomacyTest is PactsBase {
         assertEq(diplomacy.betrayals(gA, 1), 1);
     }
 
-    function test_onlyAMemberOfTheAttackingGuildCanBreakAPact() public {
+    function test_onlyAnEligibleMemberOfTheAttackingGuildCanBreakAPact() public {
         capture(bob, 7, 10); // Beta holds tile 7
         uint256 pactId = signAB(10e18, 25e18, 5);
         buy(alice, 3);
@@ -251,11 +251,77 @@ contract DiplomacyTest is PactsBase {
         assertEq(guilds.treasuryOf(gB), treasuryB);
         assertEq(realm.reserveOf(gA), 3);
         assertEq(diplomacy.betrayals(gA, 0), 0);
-        // A member who joined after the proposal cannot vote on it, but is a member and may declare.
+        // Joining after the proposal grants neither a vote nor permission to trigger its betrayal.
         join(erin, gA);
-        declareAs(erin, pid);
+        vm.prank(erin);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        realm.declareAttack(pid);
+        assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Active));
+        assertEq(guilds.treasuryOf(gA), treasuryA);
+        assertEq(guilds.treasuryOf(gB), treasuryB);
+        assertFalse(guilds.getProposal(pid).executed);
+        declareAs(alice, pid);
         assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Broken));
         assertEq(guilds.treasuryOf(gB), treasuryB + 35e18);
+        assertEq(diplomacy.betrayals(gA, 0), 1);
+    }
+
+    function test_staleAttackCannotBeDeclaredByLateOrRejoinedMembers() public {
+        capture(bob, 7, 10);
+        buy(alice, 3);
+        uint256 pid = proposeAttack(alice, 7, gB, 3);
+        uint256 pactId = signAB(10e18, 25e18, 5); // The approved attack predates the pact.
+        uint256 treasuryA = guilds.treasuryOf(gA);
+        uint256 treasuryB = guilds.treasuryOf(gB);
+
+        // Even in the same timestamp, the join sequence is later than the voting snapshot.
+        join(erin, gA);
+        assertGt(guilds.memberSeq(gA, erin), guilds.getProposal(pid).seqAtCreation);
+        vm.prank(erin);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        realm.declareAttack(pid);
+
+        // The original proposer also loses eligibility on leaving, including after rejoining.
+        vm.prank(alice);
+        guilds.leave();
+        vm.prank(alice);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        realm.declareAttack(pid);
+        join(alice, gA);
+        assertGt(guilds.memberSeq(gA, alice), guilds.getProposal(pid).seqAtCreation);
+        vm.prank(alice);
+        vm.expectRevert(Realm.BetrayalRequiresMember.selector);
+        realm.declareAttack(pid);
+
+        assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Active));
+        assertEq(diplomacy.activePactBetween(gA, gB), pactId);
+        assertEq(guilds.treasuryOf(gA), treasuryA);
+        assertEq(guilds.treasuryOf(gB), treasuryB);
+        assertEq(token.balanceOf(address(diplomacy)), 35e18);
+        assertEq(realm.reserveOf(gA), 3);
+        assertFalse(realm.hasPendingAttack(gA, gB));
+        assertFalse(guilds.getProposal(pid).executed);
+        assertEq(diplomacy.betrayals(gA, 0), 0);
+    }
+
+    function test_memberAtSnapshotBoundaryCanDeclareApprovedBetrayalWithoutVoting() public {
+        capture(bob, 7, 10);
+        uint256 pactId = signAB(10e18, 25e18, 5);
+        join(erin, gA);
+        join(dave, gA);
+        buy(alice, 3);
+        uint256 pid = proposeAttack(alice, 7, gB, 3);
+        voteYes(erin, pid); // Two of three eligible members approve.
+        assertEq(guilds.memberSeq(gA, dave), guilds.getProposal(pid).seqAtCreation);
+        assertFalse(guilds.hasVoted(pid, dave));
+
+        declareAs(dave, pid);
+        assertTrue(guilds.getProposal(pid).executed);
+        assertEq(uint256(diplomacy.getPact(pactId).status), uint256(Diplomacy.Status.Broken));
+        assertEq(guilds.treasuryOf(gA), 90e18);
+        assertEq(guilds.treasuryOf(gB), 110e18);
+        assertEq(token.balanceOf(address(diplomacy)), 0);
+        assertEq(realm.reserveOf(gA), 0);
         assertEq(diplomacy.betrayals(gA, 0), 1);
     }
 

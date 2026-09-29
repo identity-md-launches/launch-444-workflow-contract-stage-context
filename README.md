@@ -43,7 +43,7 @@ Realm($token, $contract:Guilds, 3600, 604800, 1e18, 500)
 deployment receipt also contains the three creation traces. Each nested contract records its
 creator as an immutable and trusts only that address, so no binding step, no initializer and no
 front-running window exist. Nothing here uses DELEGATECALL, CALLCODE or SELFDESTRUCT; the nested
-contracts are created with plain CREATE from Realm's init code, and Realm's runtime is 10.1 KB.
+contracts are created with plain CREATE from Realm's init code, and Realm's runtime is 10,290 bytes.
 
 `$owner` is not used by any contract. The game has no owner.
 
@@ -124,9 +124,10 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
   holder differs from the holder named when the proposal was created, if the guild would attack its
   own tile, if the reserve is too small, or if the guild already attacks that tile this epoch.
   **Exception:** an attack that would break an active pact (the named holder is a pact partner and
-  the pact has not run out) can only be declared by a member of the attacking guild
-  (`BetrayalRequiresMember`). Betraying costs the guild its bond, so no outsider, and in particular
-  not the partner, can trigger it by declaring a stale approved proposal.
+  the pact has not run out) can only be declared by a current member of the attacking guild whose
+  join sequence is at most the proposal's `seqAtCreation` (`BetrayalRequiresMember`). This matches
+  voting eligibility; joining or rejoining after proposal creation cannot grant permission to
+  trigger a betrayal. An eligible member need not have personally voted on the approved proposal.
 - `Realm.settle()` (anyone) settles the next unsettled epoch once it has ended. Epochs settle in
   order; `settlePending(max)` catches up several at once. Settlement first distributes the epoch's
   income, then resolves every attacked tile, then (for the last epoch of a season) records standings.
@@ -135,7 +136,8 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
   losses) and returns `true` when the epoch is complete. Income is distributed on the first step,
   tiles are resolved one after another, standings are recorded on the last step, and
   `settledEpochs` advances only then. `settle()` finishes a settlement that `settleStep` started.
-  `settlementProgress()` reports where a settlement stands. This keeps every settlement
+  `settlementProgress()` reports where a settlement stands and returns `(false, 0, 0)` whenever
+  no settlement has started, including when attacks are queued. This keeps every settlement
   transaction inside a block however many attacks were declared, so settlement can never be
   frozen by spam.
 - **Void attacks.** An attack names the holder it was declared against. If, when its epoch is
@@ -161,11 +163,12 @@ genesis + (e+1)·epochLength)`. Season `s` covers epochs `[s·168, s·168 + 167]
 - If a guild declares an attack on a tile held by its partner during that window, Realm reports it
   in the same transaction and Diplomacy pays the attacker's bond **and** the victim's own bond into
   the victim's treasury. The attack itself still resolves. The betrayal is counted in the season of
-  the attack. Only a member of the attacking guild can declare such an attack (see above);
+  the attack. Only a current member eligible for the proposal's vote can declare such an attack (see above);
   `Diplomacy.wouldBreakPact(attacker, defender, epoch)` tells whether a declaration would be one.
 - A guild that has approved an attack on another guild and then signs a pact with it should let the
   proposal expire (end of the next epoch) or declare it before signing: while the pact is active the
-  proposal can only be declared by the guild's own members, and doing so is a betrayal.
+  proposal can only be declared by current members who joined before its creation, and doing so
+  is a betrayal.
 - If the window has passed, anyone can call `Diplomacy.expire(pactId)` to return both bonds. An
   attack after the window that arrives before `expire` simply expires the pact.
 
@@ -212,7 +215,9 @@ Nothing needs an operator, but somebody has to send the permissionless transacti
   and income is distributed only on settlement. The website should offer a "settle" button and a
   keeper may call it. If an epoch holds too many attacks for one transaction (`settle()` runs out
   of gas), call `settleStep(maxAttacks)` repeatedly (a few hundred per call is comfortable) until
-  it returns `true`; `settlementProgress()` shows how far it got.
+  it returns `true`; `settlementProgress()` shows how far it got. Use
+  `currentEpoch() > settledEpochs()` to detect ended epochs needing settlement; the progress view
+  reports only a settlement already in progress.
 - **Collect income**: `Realm.collectIncome(guild)` moves accrued income to the treasury before it
   can be spent by vote.
 - **Expire pacts**: `Diplomacy.expire(pactId)` after the last epoch of the pact to return bonds.
@@ -236,6 +241,10 @@ stepwise settlement exists so that this can only make settlement slower, never i
   Season and Banners trust only their creator (Realm, Realm, Season respectively).
 - Approval semantics are fixed at proposal creation (eligible voters and denominator). Members who
   leave after creation still count in the denominator; expelled members lose their vote.
+- Membership is permissionless and does not prove an independent identity. The betrayal gate
+  excludes wallets that joined after the attack proposal, but an adversary already eligible at
+  proposal creation can declare an approved betrayal. Check outstanding proposals before signing
+  a pact; approval is not revoked by a later pact.
 - Membership at season end is determined from join/leave stints, so leaving and rejoining across the
   season boundary is handled exactly.
 - The peace banner is awarded to every guild that existed at season end without a betrayal, whether
@@ -257,7 +266,7 @@ stepwise settlement exists so that this can only make settlement slower, never i
   and all value flows are described above.
 - Tests are not an audit. The contracts hold player funds and must go through the independent
   adversarial review before the launch is admitted. No Slither or Mythril run was part of this
-  assignment; `forge build`, `forge test` (108 tests, including fuzzing on the token) and
+  assignment; `forge build`, `forge test` (111 permanent tests, including fuzzing on the token) and
   `forge fmt --check` were run, and the protected launch floor tests were exercised locally against
   the real init code with computed CREATE2 addresses.
 
@@ -274,6 +283,14 @@ Second round, after the independent review of the first accepted version:
   the partner could declare a stale approved proposal and collect both bonds.
 - Settlement can be split over several transactions (`settleStep`) so an epoch with any number of
   attacks can always be settled.
+
+Third round, after reproducing both follow-up findings:
+
+- Pact-breaking declarations now require current membership and eligibility at proposal creation.
+  Late joins and rejoining cannot trigger stale approved attacks; eligible members can still
+  declare them, and attacks that break no pact remain permissionless.
+- `settlementProgress()` now returns zeros whenever no settlement is in progress, even if the
+  next epoch to settle already contains attacks.
 
 ## Development
 
